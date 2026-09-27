@@ -1,21 +1,76 @@
-import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
-import cv2
-from PIL import Image, ImageTk, ImageDraw, ImageFont
-import face_recognition
-import numpy as np
-from datetime import datetime
 import sys
 import os
-import csv
 import traceback
 
-from db import (
-    init_db, add_member, update_subscription, delete_member,
-    get_all_members, get_base_dir, log_access, get_access_log,
-)
-from liveness import LivenessTracker, compute_ear_from_landmarks
-from auth import run_login_flow
+
+def _fatal_startup_error(exc_type, exc_value, exc_tb):
+    """Affiche et journalise une erreur survenue AVANT que le gestionnaire
+    d'erreurs normal (sys.excepthook, plus bas) ne soit installe -
+    typiquement une dependance manquante ou mal installee (dlib,
+    face_recognition, opencv...).
+
+    Sans ceci, l'appli plantait de facon totalement SILENCIEUSE au
+    double-clic : en mode .exe/fenetre (pas de console), une exception a
+    l'import n'a nulle part ou s'afficher -> rien ne se passe a l'ecran,
+    ce qui est tres difficile a diagnostiquer pour l'utilisateur."""
+    # Reproduit ici la logique de db.get_base_dir() sans en dependre : si
+    # l'echec d'import vient justement de db.py (ex: numpy manquant), on ne
+    # peut pas s'appuyer dessus pour savoir ou ecrire le log.
+    if getattr(sys, "frozen", False):
+        base_dir = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "FaceID")
+        try:
+            os.makedirs(base_dir, exist_ok=True)
+        except OSError:
+            base_dir = os.path.expanduser("~")
+    else:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+    log_path = os.path.join(base_dir, "error.log")
+    message = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+    try:
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(message)
+    except OSError:
+        log_path = "error.log (ecriture impossible, voir console)"
+
+    try:
+        import tkinter as _tk
+        from tkinter import messagebox as _messagebox
+        _root = _tk.Tk()
+        _root.withdraw()
+        _messagebox.showerror(
+            "Erreur au demarrage - FaceID",
+            "L'application n'a pas pu demarrer, probablement a cause d'une "
+            "dependance manquante ou mal installee\n(dlib / face_recognition / "
+            "opencv-python / Pillow - voir requirements.txt).\n\n"
+            f"Details enregistres dans :\n{log_path}\n\n"
+            f"Erreur : {exc_type.__name__}: {exc_value}",
+        )
+        _root.destroy()
+    except Exception:
+        # Meme tkinter indisponible : au moins le fichier error.log existe.
+        pass
+
+
+try:
+    import tkinter as tk
+    from tkinter import ttk, messagebox, filedialog
+    import cv2
+    from PIL import Image, ImageTk, ImageDraw, ImageFont
+    import face_recognition
+    import numpy as np
+    from datetime import datetime
+    import csv
+
+    from db import (
+        init_db, add_member, update_subscription, delete_member,
+        get_all_members, get_base_dir, log_access, get_access_log,
+    )
+    from liveness import LivenessTracker, compute_ear_from_landmarks
+    from auth import run_login_flow
+except Exception:
+    _fatal_startup_error(*sys.exc_info())
+    sys.exit(1)
+
 
 # ----------------------------------------------------------------------------
 # Configuration
