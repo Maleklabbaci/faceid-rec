@@ -28,6 +28,7 @@ Utilisation typique (voir main.py / app.py) :
 """
 
 import time
+import cv2
 import face_recognition
 
 EAR_THRESHOLD = 0.21       # sous ce seuil, l'oeil est considere ferme
@@ -52,12 +53,34 @@ def eye_aspect_ratio(eye_points):
     return (a + b) / (2.0 * c)
 
 
-def compute_ear_from_landmarks(rgb_frame, face_box):
-    """Detecte les landmarks du visage `face_box` (top, right, bottom, left)
-    dans `rgb_frame` (RGB, pleine resolution recommandee) et renvoie l'EAR
-    moyen des deux yeux, ou None si les landmarks n'ont pas pu etre extraits.
+def compute_ear_from_landmarks(frame_bgr, face_box, margin=20):
+    """Detecte les landmarks des yeux pour `face_box` (top, right, bottom,
+    left, en coordonnees pleine resolution) et renvoie l'EAR moyen des deux
+    yeux, ou None si les landmarks n'ont pas pu etre extraits.
+
+    Optimisation performance : au lieu de convertir toute l'image BGR->RGB
+    (l'operation la plus couteuse a chaque frame sur un flux HD), on ne
+    decoupe et convertit que la petite zone du visage (+ marge). Le
+    detecteur de landmarks dlib n'a de toute facon besoin que de cette
+    region ; ca reduit fortement le cout CPU par rapport a une conversion
+    plein cadre a chaque frame.
     """
-    landmarks_list = face_recognition.face_landmarks(rgb_frame, face_locations=[face_box])
+    top, right, bottom, left = face_box
+    h, w = frame_bgr.shape[:2]
+
+    top_m = max(0, top - margin)
+    left_m = max(0, left - margin)
+    bottom_m = min(h, bottom + margin)
+    right_m = min(w, right + margin)
+
+    crop = frame_bgr[top_m:bottom_m, left_m:right_m]
+    if crop.size == 0:
+        return None
+
+    rgb_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+    box_in_crop = (top - top_m, right - left_m, bottom - top_m, left - left_m)
+
+    landmarks_list = face_recognition.face_landmarks(rgb_crop, face_locations=[box_in_crop])
     if not landmarks_list:
         return None
     landmarks = landmarks_list[0]
@@ -98,6 +121,18 @@ class LivenessTracker:
 
     def reset(self, key):
         self._states.pop(key, None)
+
+    def is_verified(self, key):
+        """Renvoie True si `key` a deja ete verifiee (clignement detecte) et
+        est toujours consideree presente (vue recemment). Permet d'eviter de
+        relancer le calcul EAR (couteux : crop + conversion + landmarks
+        dlib) une fois la liveness confirmee pour cette identite."""
+        state = self._states.get(key)
+        if state is None:
+            return False
+        if (time.time() - state["last_seen"]) > self.reset_after:
+            return False
+        return state["verified"]
 
     def cleanup(self):
         """A appeler periodiquement pour oublier les identites plus vues

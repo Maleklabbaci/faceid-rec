@@ -20,6 +20,10 @@ ARDUINO_PORT = "COM3"
 TOLERANCE = 0.5
 REQUIRE_BLINK = True  # Anti-spoofing : exige un clignement des yeux avant d'ouvrir l'accès
 
+# --- Performance ---
+RESIZE_FACTOR = 0.25       # sous-echantillonnage utilise pour la detection/l'encodage
+DETECT_EVERY_N_FRAMES = 2  # ne relance la detection+reconnaissance complete qu'1 frame sur N
+
 # Certains pilotes de webcam (surtout via le backend DirectShow / CAP_DSHOW sous
 # Windows) renvoient un flux dont les lignes sont stockees "bottom-up", ce qui
 # fait apparaitre l'image inversee verticalement. On corrige ca ici, puis on
@@ -133,6 +137,12 @@ class App(tk.Tk):
         if not self.cap.isOpened():
             self.cap = cv2.VideoCapture(0)
         self.camera_ok = self.cap.isOpened()
+        if self.camera_ok:
+            # Demande un flux plus leger a la camera : moins de pixels a
+            # decoder/copier a chaque frame (la reconnaissance re-downscale
+            # de toute facon a RESIZE_FACTOR pour la detection).
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         if not self.camera_ok:
             messagebox.showerror(
                 "Erreur",
@@ -142,10 +152,17 @@ class App(tk.Tk):
 
         self.last_frame = None
         self.members = []
+        self.known_ids = []
+        self.known_encodings = []
+        self.known_names = []
+        self.known_subs = []
         self.last_notified_id = None
         self.nav_buttons = {}
         self.active_view = "members"
         self.liveness_tracker = LivenessTracker()
+        self.scan_frame_count = 0
+        self.scan_detections = []       # cache des dernieres boites/statuts (evite de re-detecter chaque frame)
+        self.scan_last_status = ("En attente...", "neutral")
 
         self.reload_members()
         self.build_layout()
@@ -340,6 +357,12 @@ class App(tk.Tk):
 
     def reload_members(self):
         self.members = get_all_members()
+        # Caches reconstruits une seule fois ici plutot qu'a chaque frame
+        # dans process_recognition (evite du travail inutile ~30x/seconde).
+        self.known_ids = [m["id"] for m in self.members]
+        self.known_encodings = [m["encoding"] for m in self.members]
+        self.known_names = [m["name"] for m in self.members]
+        self.known_subs = [m["subscription_end"] for m in self.members]
         if hasattr(self, "tree"):
             self.tree.delete(*self.tree.get_children())
             for i, m in enumerate(self.members):
@@ -503,79 +526,100 @@ class App(tk.Tk):
         label.configure(text=text, fg=fg, bg=bg)
 
     def process_recognition(self, frame):
-        small = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
-        rgb_small = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
-        rgb_full = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        locations = face_recognition.face_locations(rgb_small)
-        encodings = face_recognition.face_encodings(rgb_small, locations)
+        self.scan_frame_count += 1
+        run_detection = (self.scan_frame_count % DETECT_EVERY_N_FRAMES == 0) or not self.scan_detections
 
-        known_ids = [m["id"] for m in self.members]
-        known_encodings = [m["encoding"] for m in self.members]
-        known_names = [m["name"] for m in self.members]
-        known_subs = [m["subscription_end"] for m in self.members]
+        if run_detection:
+            inv_resize = 1.0 / RESIZE_FACTOR
+            small = cv2.resize(frame, (0, 0), fx=RESIZE_FACTOR, fy=RESIZE_FACTOR)
+            rgb_small = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+            locations = face_recognition.face_locations(rgb_small, model="hog")
+            encodings = face_recognition.face_encodings(rgb_small, locations)
 
-        status_text, status_kind = "En attente...", "neutral"
-        current_id = None
+            status_text, status_kind = "En attente...", "neutral"
+            current_id = None
+            detections = []
 
-        for (top, right, bottom, left), face_encoding in zip(locations, encodings):
-            top, right, bottom, left = top * 4, right * 4, bottom * 4, left * 4
-            name, color = "Inconnu", (0, 0, 255)
+            for (top, right, bottom, left), face_encoding in zip(locations, encodings):
+                top, right, bottom, left = (int(top * inv_resize), int(right * inv_resize),
+                                             int(bottom * inv_resize), int(left * inv_resize))
+                name, color = "Inconnu", (0, 0, 255)
 
-            if known_encodings:
-                matches = face_recognition.compare_faces(known_encodings, face_encoding, tolerance=TOLERANCE)
-                distances = face_recognition.face_distance(known_encodings, face_encoding)
-                if True in matches:
-                    idx = int(np.argmin(distances))
-                    if matches[idx]:
-                        name = known_names[idx]
-                        if datetime.now() <= datetime.strptime(known_subs[idx], "%Y-%m-%d"):
-                            if REQUIRE_BLINK:
-                                ear = compute_ear_from_landmarks(rgb_full, (top, right, bottom, left))
-                                verified, remaining = self.liveness_tracker.update(known_ids[idx], ear)
-                                if verified:
+                if self.known_encodings:
+                    matches = face_recognition.compare_faces(self.known_encodings, face_encoding, tolerance=TOLERANCE)
+                    distances = face_recognition.face_distance(self.known_encodings, face_encoding)
+                    if True in matches:
+                        idx = int(np.argmin(distances))
+                        if matches[idx]:
+                            name = self.known_names[idx]
+                            if datetime.now() <= datetime.strptime(self.known_subs[idx], "%Y-%m-%d"):
+                                if REQUIRE_BLINK:
+                                    member_id = self.known_ids[idx]
+                                    if self.liveness_tracker.is_verified(member_id):
+                                        # Deja verifie recemment : on evite de refaire le
+                                        # calcul EAR (crop + conversion + landmarks dlib),
+                                        # on se contente de rafraichir la presence.
+                                        self.liveness_tracker.update(member_id, None)
+                                        verified, remaining = True, 0.0
+                                    else:
+                                        ear = compute_ear_from_landmarks(frame, (top, right, bottom, left))
+                                        verified, remaining = self.liveness_tracker.update(member_id, ear)
+                                    if verified:
+                                        status_text = f"{name.upper()} - ACCES AUTORISE"
+                                        status_kind = "success"
+                                        color = (0, 200, 90)
+                                        if arduino:
+                                            arduino.write(b"OPEN\n")
+                                    else:
+                                        status_text = f"{name.upper()} - CLIGNEZ DES YEUX POUR VERIFIER ({int(remaining) + 1}s)"
+                                        status_kind = "info"
+                                        color = (235, 149, 34)
+                                else:
                                     status_text = f"{name.upper()} - ACCES AUTORISE"
                                     status_kind = "success"
                                     color = (0, 200, 90)
                                     if arduino:
                                         arduino.write(b"OPEN\n")
-                                else:
-                                    status_text = f"{name.upper()} - CLIGNEZ DES YEUX POUR VERIFIER ({int(remaining) + 1}s)"
-                                    status_kind = "info"
-                                    color = (235, 149, 34)
                             else:
-                                status_text = f"{name.upper()} - ACCES AUTORISE"
-                                status_kind = "success"
-                                color = (0, 200, 90)
-                                if arduino:
-                                    arduino.write(b"OPEN\n")
+                                status_text = f"{name.upper()} - ABONNEMENT EXPIRE"
+                                status_kind = "warning"
+                                color = (0, 165, 255)
+                                if REQUIRE_BLINK:
+                                    self.liveness_tracker.reset(self.known_ids[idx])
                         else:
-                            status_text = f"{name.upper()} - ABONNEMENT EXPIRE"
-                            status_kind = "warning"
-                            color = (0, 165, 255)
-                            if REQUIRE_BLINK:
-                                self.liveness_tracker.reset(known_ids[idx])
+                            status_text, status_kind = "ACCES REFUSE", "danger"
                     else:
                         status_text, status_kind = "ACCES REFUSE", "danger"
-                else:
-                    status_text, status_kind = "ACCES REFUSE", "danger"
 
-            cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
-            cv2.putText(frame, name, (left + 6, top - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                detections.append(((top, right, bottom, left), name, color))
+
+                if current_id is None:
+                    current_id = name  # on ne notifie que pour le premier visage detecte
+
+            if REQUIRE_BLINK:
+                self.liveness_tracker.cleanup()
+
+            self.scan_detections = detections
+            self.scan_last_status = (status_text, status_kind)
 
             if current_id is None:
-                current_id = name  # on ne notifie que pour le premier visage detecte
+                self.last_notified_id = None
+            elif current_id != self.last_notified_id:
+                self.last_notified_id = current_id
+                if current_id == "Inconnu":
+                    self.show_notification("Visage inconnu detecte - veuillez enregistrer la personne", Theme.danger)
+                else:
+                    self.show_notification(f"{current_id} a ete reconnu", Theme.success)
+        else:
+            # Frame intermediaire : on reaffiche les dernieres boites/statuts
+            # connus sans relancer toute la detection/reconnaissance faciale
+            # (economise l'essentiel du cout CPU tout en restant fluide a
+            # l'ecran).
+            status_text, status_kind = self.scan_last_status
 
-        if REQUIRE_BLINK:
-            self.liveness_tracker.cleanup()
-
-        if current_id is None:
-            self.last_notified_id = None
-        elif current_id != self.last_notified_id:
-            self.last_notified_id = current_id
-            if current_id == "Inconnu":
-                self.show_notification("Visage inconnu detecte - veuillez enregistrer la personne", Theme.danger)
-            else:
-                self.show_notification(f"{current_id} a ete reconnu", Theme.success)
+        for (top, right, bottom, left), name, color in self.scan_detections:
+            cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
+            cv2.putText(frame, name, (left + 6, top - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
         return frame, status_text, status_kind
 
