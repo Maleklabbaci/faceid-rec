@@ -29,15 +29,15 @@ Le visage d'une personne, une fois transformé en donnée numérique pour la rec
 
 ## Ce qui a déjà été mis en place techniquement dans le logiciel
 
-- Une case à cocher obligatoire dans l'écran "Enregistrer" (`app.py`) empêche d'ajouter un membre sans confirmer que le consentement a été recueilli.
-- Chaque membre enregistré garde une trace (`consent_given`, `consent_date`) dans la base de données.
-- Le script en ligne de commande `register.py` demande aussi une confirmation explicite avant tout enregistrement.
+- **Consentement implicite et automatique** : se présenter volontairement devant la caméra pour se faire enregistrer (écran "Enregistrer" de `app.py`, ou `register.py`) est considéré comme une acceptation — il n'y a plus de case à cocher qui bloque le flux, l'enregistrement est immédiat.
+- Chaque membre enregistré garde quand même une trace (`consent_given=True`, `consent_date`) dans la base de données, horodatée automatiquement.
+- Cette approche est plus rapide/fluide pour l'opérateur, mais elle repose sur le fait que la personne comprend ce qui se passe : c'est pour ça que l'affichage d'une information visible à l'accueil (voir checklist ci-dessus) reste important.
 
 ## Ce qui reste à la charge du gérant / installateur
 
-- Faire réellement signer le formulaire papier (le logiciel ne peut pas vérifier qu'il a été signé, seulement qu'on l'a coché).
+- **Informer visiblement** les personnes avant qu'elles ne se présentent devant la caméra (affichette à l'accueil, explication orale) — puisque le logiciel ne demande plus de confirmation explicite, c'est cette information préalable qui rend le consentement valable.
+- Pour les cas sensibles (mineurs, environnements réglementés), garder `docs/formulaire_consentement.md` en réserve et le faire signer manuellement si vous préférez une preuve papier.
 - Vérifier auprès de l'ANPDP si son cas nécessite une formalité préalable.
-- Informer visiblement les personnes filmées/reconnues.
 - Répondre aux demandes de suppression de données.
 
 ## Ressources

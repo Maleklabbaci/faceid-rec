@@ -424,29 +424,19 @@ class App(tk.Tk):
         tk.Label(form_inner, text="Fin d'abonnement (AAAA-MM-JJ)", bg=Theme.bg_card, fg=Theme.text_muted,
                  font=(Theme.font_family, 9)).pack(anchor="w")
         self.date_entry = ttk.Entry(form_inner, style="Faceid.TEntry")
-        self.date_entry.pack(fill="x", pady=(4, 14))
-
-        # Consentement obligatoire avant tout enregistrement d'une donnee
-        # biometrique (visage) - voir docs/formulaire_consentement.md et
-        # loi algerienne n 18-07 sur la protection des donnees personnelles.
-        self.consent_var = tk.BooleanVar(value=False)
-        consent_check = tk.Checkbutton(
-            form_inner,
-            text="La personne a signe le formulaire de consentement\n(stockage de son visage)",
-            variable=self.consent_var, bg=Theme.bg_card, fg=Theme.text_main,
-            activebackground=Theme.bg_card, font=(Theme.font_family, 9),
-            anchor="w", justify="left", wraplength=220,
-        )
-        consent_check.pack(fill="x", pady=(0, 18), anchor="w")
+        self.date_entry.pack(fill="x", pady=(4, 22))
 
         capture_btn = tk.Button(form_inner, text="📸  Capturer & enregistrer", command=self.capture_member)
         style_button(capture_btn, Theme.accent, "white", Theme.accent_hover)
         capture_btn.pack(fill="x")
 
         tk.Label(form_inner, text="Placez-vous face a la camera jusqu'a ce que le badge\n"
-                                   "passe au vert, puis remplissez le formulaire.",
+                                   "passe au vert, puis remplissez le formulaire.\n"
+                                   "Se presenter volontairement devant la camera vaut\n"
+                                   "consentement a l'enregistrement du visage.",
                  bg=Theme.bg_card, fg=Theme.text_muted, font=(Theme.font_family, 9),
                  justify="left").pack(anchor="w", pady=(16, 0))
+
 
     def capture_member(self):
         name = self.name_entry.get().strip()
@@ -459,14 +449,6 @@ class App(tk.Tk):
         except ValueError:
             messagebox.showerror("Erreur", "Format de date invalide (AAAA-MM-JJ).")
             return
-        if not self.consent_var.get():
-            messagebox.showwarning(
-                "Consentement requis",
-                "Vous devez cocher la case confirmant que la personne a signe\n"
-                "le formulaire de consentement avant d'enregistrer son visage\n"
-                "(donnee biometrique - voir docs/formulaire_consentement.md).",
-            )
-            return
         if self.last_frame is None:
             messagebox.showerror("Erreur", "Pas de flux camera.")
             return
@@ -477,11 +459,13 @@ class App(tk.Tk):
             messagebox.showerror("Erreur", "Aucun visage detecte.")
             return
 
+        # Consentement automatique : se presenter volontairement devant la
+        # camera pour se faire enregistrer vaut acceptation (voir
+        # docs/conformite_donnees.md pour le detail).
         add_member(name, encs[0], date_str, consent=True)
         messagebox.showinfo("OK", f"{name} enregistre jusqu'au {date_str}.")
         self.name_entry.delete(0, "end")
         self.date_entry.delete(0, "end")
-        self.consent_var.set(False)
         self.reload_members()
 
     # ================= Vue : Reconnaissance =================
