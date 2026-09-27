@@ -29,6 +29,15 @@ def init_db():
             consent_date TEXT
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS access_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            member_id INTEGER,
+            name TEXT NOT NULL,
+            status TEXT NOT NULL,
+            timestamp TEXT NOT NULL
+        )
+    """)
     # Migration douce : si la base existait deja avant l'ajout du consentement
     # (loi 18-07 sur les donnees biometriques), on ajoute les colonnes sans
     # perdre les membres deja enregistres.
@@ -43,9 +52,8 @@ def init_db():
 
 def add_member(name, encoding, subscription_end, photo_path=None, consent=False):
     """Enregistre un membre. `consent` doit valoir True uniquement si la
-    personne a explicitement accepte que son visage (donnee biometrique)
-    soit stocke (voir docs/formulaire_consentement.md) - cf. loi algerienne
-    n 18-07 sur la protection des donnees personnelles."""
+    personne a accepte (implicitement ou explicitement) que son visage
+    (donnee biometrique) soit stocke - voir docs/conformite_donnees.md."""
     conn = sqlite3.connect(DB_PATH)
     consent_date = datetime.now().strftime("%Y-%m-%d %H:%M") if consent else None
     conn.execute(
@@ -62,6 +70,21 @@ def update_subscription(member_id, new_date):
     conn.execute("UPDATE members SET subscription_end = ? WHERE id = ?", (new_date, member_id))
     conn.commit()
     conn.close()
+
+
+def delete_member(member_id):
+    """Supprime definitivement un membre (donnee biometrique incluse) et sa
+    photo associee si elle existe. Utilise pour le droit a l'effacement."""
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute("SELECT photo_path FROM members WHERE id = ?", (member_id,)).fetchone()
+    conn.execute("DELETE FROM members WHERE id = ?", (member_id,))
+    conn.commit()
+    conn.close()
+    if row and row[0]:
+        try:
+            os.remove(row[0])
+        except OSError:
+            pass
 
 
 def get_all_members():
@@ -81,3 +104,28 @@ def get_all_members():
             "consent_date": row[5],
         })
     return members
+
+
+def log_access(name, status, member_id=None):
+    """Enregistre une tentative d'acces (reconnu/refuse/expire) dans
+    l'historique, pour pouvoir repondre a 'qui est entre et quand'."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO access_log (member_id, name, status, timestamp) VALUES (?, ?, ?, ?)",
+        (member_id, name, status, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_access_log(limit=500):
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT id, member_id, name, status, timestamp FROM access_log ORDER BY id DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    conn.close()
+    return [
+        {"id": r[0], "member_id": r[1], "name": r[2], "status": r[3], "timestamp": r[4]}
+        for r in rows
+    ]

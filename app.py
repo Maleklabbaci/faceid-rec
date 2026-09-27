@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 import cv2
 from PIL import Image, ImageTk, ImageDraw, ImageFont
 import face_recognition
@@ -7,10 +7,15 @@ import numpy as np
 from datetime import datetime
 import sys
 import os
+import csv
 import traceback
 
-from db import init_db, add_member, update_subscription, get_all_members, get_base_dir
+from db import (
+    init_db, add_member, update_subscription, delete_member,
+    get_all_members, get_base_dir, log_access, get_access_log,
+)
 from liveness import LivenessTracker, compute_ear_from_landmarks
+from auth import run_login_flow
 
 # ----------------------------------------------------------------------------
 # Configuration
@@ -216,12 +221,14 @@ class App(tk.Tk):
         self.view_members = tk.Frame(self.content, bg=Theme.bg_app)
         self.view_register = tk.Frame(self.content, bg=Theme.bg_app)
         self.view_scan = tk.Frame(self.content, bg=Theme.bg_app)
-        for v in (self.view_members, self.view_register, self.view_scan):
+        self.view_history = tk.Frame(self.content, bg=Theme.bg_app)
+        for v in (self.view_members, self.view_register, self.view_scan, self.view_history):
             v.place(x=0, y=0, relwidth=1, relheight=1)
 
         self.build_members_view()
         self.build_register_view()
         self.build_scan_view()
+        self.build_history_view()
 
     def build_sidebar(self):
         header = tk.Frame(self.sidebar, bg=Theme.bg_sidebar)
@@ -240,6 +247,7 @@ class App(tk.Tk):
             ("members", "👥", "Membres"),
             ("register", "🧾", "Enregistrer"),
             ("scan", "🛡️", "Reconnaissance"),
+            ("history", "🕘", "Historique"),
         ]
         for key, icon, label in nav_items:
             self.build_nav_button(key, icon, label)
@@ -289,9 +297,15 @@ class App(tk.Tk):
             else:
                 btn.configure(bg=Theme.bg_sidebar, fg=Theme.text_on_dark_muted,
                               font=(Theme.font_family, 11, "normal"))
-        {"members": self.view_members, "register": self.view_register, "scan": self.view_scan}[key].tkraise()
+        views = {
+            "members": self.view_members, "register": self.view_register,
+            "scan": self.view_scan, "history": self.view_history,
+        }
+        views[key].tkraise()
         if key == "members":
             self.reload_members()
+        elif key == "history":
+            self.reload_history()
 
     def update_clock(self):
         self.clock_label.config(text=datetime.now().strftime("%A %d %B %Y - %H:%M"))
@@ -355,6 +369,10 @@ class App(tk.Tk):
         style_button(renew_btn, Theme.accent, "white", Theme.accent_hover)
         renew_btn.grid(row=2, column=1, sticky="w", padx=(14, 0), pady=(4, 0))
 
+        delete_btn = tk.Button(renew_inner, text="🗑  Supprimer le membre", command=self.delete_selected)
+        style_button(delete_btn, Theme.danger, "white", "#B91C1C")
+        delete_btn.grid(row=2, column=2, sticky="w", padx=(14, 0), pady=(4, 0))
+
     def reload_members(self):
         self.members = get_all_members()
         # Caches reconstruits une seule fois ici plutot qu'a chaque frame
@@ -384,6 +402,25 @@ class App(tk.Tk):
             messagebox.showerror("Erreur", "Format de date invalide (AAAA-MM-JJ).")
             return
         update_subscription(int(sel[0]), date_str)
+        self.reload_members()
+
+    def delete_selected(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showwarning("Info", "Selectionnez un membre a supprimer.")
+            return
+        member_id = int(sel[0])
+        values = self.tree.item(sel[0], "values")
+        name = values[1] if len(values) > 1 else str(member_id)
+        if not messagebox.askyesno(
+            "Confirmer la suppression",
+            f"Supprimer definitivement {name} et son visage enregistre ?\n"
+            "Cette action est irreversible (droit a l'effacement des donnees biometriques).",
+        ):
+            return
+        delete_member(member_id)
+        if REQUIRE_BLINK:
+            self.liveness_tracker.reset(member_id)
         self.reload_members()
 
     # ================= Vue : Enregistrer =================
@@ -487,6 +524,71 @@ class App(tk.Tk):
         self.scan_status = rounded_badge(video_inner, "En attente...", Theme.neutral, Theme.neutral_soft)
         self.scan_status.configure(font=(Theme.font_family, 13, "bold"))
         self.scan_status.pack()
+
+    # ================= Vue : Historique =================
+    def build_history_view(self):
+        parent = self.view_history
+        self.page_header(parent, "Historique", "Qui est entre, quand, et avec quel statut d'acces.")
+
+        body = tk.Frame(parent, bg=Theme.bg_app)
+        body.pack(fill="both", expand=True, padx=36, pady=(0, 30))
+
+        toolbar = tk.Frame(body, bg=Theme.bg_app)
+        toolbar.pack(fill="x", pady=(0, 12))
+
+        refresh_btn = tk.Button(toolbar, text="🔄  Actualiser", command=self.reload_history)
+        style_button(refresh_btn, Theme.neutral, "white", "#555B6E", padx=14, pady=8)
+        refresh_btn.pack(side="left")
+
+        export_btn = tk.Button(toolbar, text="⬇️  Exporter en CSV", command=self.export_history_csv)
+        style_button(export_btn, Theme.accent, "white", Theme.accent_hover, padx=14, pady=8)
+        export_btn.pack(side="left", padx=(10, 0))
+
+        list_card = self.make_card(body)
+        list_card.outer.pack(fill="both", expand=True)
+
+        cols = ("timestamp", "name", "status")
+        self.history_tree = ttk.Treeview(list_card, columns=cols, show="headings", style="Faceid.Treeview")
+        headings = {"timestamp": "Date / heure", "name": "Personne", "status": "Statut"}
+        widths = {"timestamp": 180, "name": 260, "status": 320}
+        for c in cols:
+            self.history_tree.heading(c, text=headings[c])
+            self.history_tree.column(c, width=widths[c], anchor="w")
+        self.history_tree.pack(fill="both", expand=True, padx=16, pady=16)
+        self.history_tree.tag_configure("odd", background="#FAFAFC")
+        self.history_tree.tag_configure("even", background=Theme.bg_card)
+
+    def reload_history(self):
+        if not hasattr(self, "history_tree"):
+            return
+        self.history_tree.delete(*self.history_tree.get_children())
+        for i, entry in enumerate(get_access_log(limit=500)):
+            tag = "even" if i % 2 == 0 else "odd"
+            self.history_tree.insert(
+                "", "end",
+                values=(entry["timestamp"], entry["name"], entry["status"]),
+                tags=(tag,),
+            )
+
+    def export_history_csv(self):
+        path = filedialog.asksaveasfilename(
+            title="Exporter l'historique des acces",
+            defaultextension=".csv",
+            filetypes=[("Fichier CSV", "*.csv")],
+            initialfile="historique_acces.csv",
+        )
+        if not path:
+            return
+        entries = get_access_log(limit=100000)
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                writer.writerow(["Date / heure", "Personne", "Statut"])
+                for entry in entries:
+                    writer.writerow([entry["timestamp"], entry["name"], entry["status"]])
+            messagebox.showinfo("Export reussi", f"Historique exporte vers :\n{path}")
+        except OSError as exc:
+            messagebox.showerror("Erreur", f"Impossible d'exporter le fichier :\n{exc}")
 
     # ---------- Boucle video partagee ----------
     def update_frame(self):
@@ -614,6 +716,7 @@ class App(tk.Tk):
                 self.last_notified_id = None
             elif current_id != self.last_notified_id:
                 self.last_notified_id = current_id
+                log_access(current_id, status_text)
                 if current_id == "Inconnu":
                     self.show_notification("Visage inconnu detecte - veuillez enregistrer la personne", Theme.danger)
                 else:
@@ -678,6 +781,12 @@ class App(tk.Tk):
 
 if __name__ == "__main__":
     try:
+        auth_root = tk.Tk()
+        auth_root.withdraw()
+        authenticated = run_login_flow(auth_root)
+        auth_root.destroy()
+        if not authenticated:
+            sys.exit(0)
         App().mainloop()
     except Exception:
         log_crash(*sys.exc_info())

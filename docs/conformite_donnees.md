@@ -24,7 +24,7 @@ Le visage d'une personne, une fois transformé en donnée numérique pour la rec
   - PC protégé par mot de passe, pas accessible à n'importe qui.
   - Sauvegardes faites de façon sécurisée (pas de copie qui traîne sur une clé USB non chiffrée).
   - Accès au logiciel réservé au personnel autorisé (gérant, responsable).
-- [ ] **Procédure de suppression** : prévoir comment supprimer les données d'une personne qui le demande ou qui quitte l'établissement (aujourd'hui : suppression manuelle via la base ou une future fonctionnalité dédiée).
+- [x] **Procédure de suppression** : disponible directement dans l'onglet Membres (bouton "Supprimer le membre") — supprime la donnée biométrique et la photo associée.
 - [ ] **Ne pas réutiliser les visages à d'autres fins** (marketing, revente, partage avec un tiers) — uniquement le contrôle d'accès prévu.
 
 ## Ce qui a déjà été mis en place techniquement dans le logiciel
@@ -32,6 +32,9 @@ Le visage d'une personne, une fois transformé en donnée numérique pour la rec
 - **Consentement implicite et automatique** : se présenter volontairement devant la caméra pour se faire enregistrer (écran "Enregistrer" de `app.py`, ou `register.py`) est considéré comme une acceptation — il n'y a plus de case à cocher qui bloque le flux, l'enregistrement est immédiat.
 - Chaque membre enregistré garde quand même une trace (`consent_given=True`, `consent_date`) dans la base de données, horodatée automatiquement.
 - Cette approche est plus rapide/fluide pour l'opérateur, mais elle repose sur le fait que la personne comprend ce qui se passe : c'est pour ça que l'affichage d'une information visible à l'accueil (voir checklist ci-dessus) reste important.
+- **Droit à l'effacement** : un bouton "Supprimer le membre" (onglet Membres) retire définitivement la donnée biométrique et la photo associée.
+- **Accès protégé par mot de passe** (`auth.py`) : seule une personne connaissant le mot de passe administrateur peut ouvrir l'application et consulter les visages/membres enregistrés.
+- **Historique des accès** (onglet Historique, export CSV) : permet de répondre à une demande de traçabilité ("qui est entré, quand") sans avoir à consulter les enregistrements vidéo.
 
 ## Ce qui reste à la charge du gérant / installateur
 

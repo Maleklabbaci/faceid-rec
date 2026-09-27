@@ -2,7 +2,7 @@ import cv2
 import face_recognition
 import numpy as np
 from datetime import datetime
-from db import init_db, get_all_members
+from db import init_db, get_all_members, log_access
 from liveness import LivenessTracker, compute_ear_from_landmarks
 
 # --- Config ---
@@ -54,6 +54,7 @@ print("[INFO] Caméra active. Appuyez sur 'q' pour quitter.")
 
 frame_count = 0
 detections = []  # boites+statuts reutilises entre deux passes de detection
+last_logged_status = {}  # nom -> dernier statut journalise (evite de spammer l'historique)
 
 while True:
     ret, frame = video.read()
@@ -111,6 +112,12 @@ while True:
                                 liveness_tracker.reset(known_ids[idx])
 
             detections.append(((top, right, bottom, left), name, status, color))
+
+            # Historique des acces : on ne journalise que lorsque le statut
+            # change pour cette identite (pas a chaque frame de detection).
+            if last_logged_status.get(name) != status:
+                last_logged_status[name] = status
+                log_access(name, status)
 
         if REQUIRE_BLINK:
             liveness_tracker.cleanup()

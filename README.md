@@ -13,7 +13,7 @@ Le plus simple : `pip install cmake` puis `pip install dlib`, ou utiliser un env
 ```bash
 python app.py
 ```
-Une fenêtre avec 3 onglets : **Membres** (liste + renouvellement), **Enregistrer** (webcam + nom + date), **Reconnaissance** (flux live avec statut d'accès). Tout est relié à la même base `members.db`.
+Un écran de connexion protège l'accès à l'application (mot de passe créé au premier lancement, voir section [Sécurité / connexion](#sécurité--connexion)). Une fois connecté : une fenêtre avec 4 onglets : **Membres** (liste, renouvellement, suppression), **Enregistrer** (webcam + nom + date), **Reconnaissance** (flux live avec statut d'accès), **Historique** (journal des accès, exportable en CSV). Tout est relié à la même base `members.db`.
 
 ### Scripts séparés (alternative en ligne de commande)
 1. `python register.py` → enregistrement d'un membre
@@ -54,6 +54,13 @@ Le dossier `docs/` contient de quoi démarcher des clients en toute légalité :
 - `docs/conformite_donnees.md` — checklist de conformité (loi n° 18-07, ANPDP) et bonnes pratiques de sécurité.
 
 Le logiciel exige désormais une confirmation de consentement (case à cocher dans `app.py`, question dans `register.py`) avant d'enregistrer le visage d'un membre, et garde une trace (`consent_given`, `consent_date`) en base.
+
+## Sécurité / connexion
+Au premier lancement de `app.py`, un écran demande de **créer un mot de passe administrateur** (stocké de façon sécurisée : sel aléatoire + hash PBKDF2, jamais en clair, dans `auth.json` à côté de `members.db`). Aux lancements suivants, ce mot de passe est demandé avant d'accéder à l'application (5 tentatives max). Ça évite que n'importe qui allumant le PC puisse consulter la liste des membres et leurs visages.
+
+## Gestion des membres et historique
+- **Suppression d'un membre** (onglet Membres) : retire définitivement la personne et son visage enregistré de la base — utile en cas de départ, ou pour répondre à une demande de suppression de données (droit à l'effacement, loi n° 18-07).
+- **Historique des accès** (onglet Historique) : chaque tentative de reconnaissance (autorisée, refusée, abonnement expiré) est journalisée avec date/heure. Exportable en CSV (bouton "Exporter en CSV") pour un suivi de présence ou une vérification a posteriori.
 
 ## Anti-spoofing (détection de clignement)
 Pour éviter qu'une simple photo (imprimée ou affichée sur un écran) suffise à ouvrir l'accès, l'app exige un **clignement des yeux** avant d'accorder l'accès à une personne reconnue et à jour de son abonnement.
