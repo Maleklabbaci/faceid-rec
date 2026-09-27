@@ -1,3 +1,10 @@
+# IMPORTANT (Windows) : n'installez pas ce fichier avec un simple
+# "pip install -r requirements.txt" -> face_recognition declare une
+# dependance sur le paquet "dlib" (compilation source, necessite Visual
+# Studio C++), meme si dlib-bin (deja precompile) est installe. Installez
+# plutot en 2 etapes - voir README.md > Installation :
+#   pip install opencv-python numpy pyserial Pillow dlib-bin face_recognition_models
+#   pip install face_recognition --no-deps
 opencv-python
 numpy
 pyserial

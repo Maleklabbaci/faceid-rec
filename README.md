@@ -1,11 +1,22 @@
 # Face ID - Contrôle d'accès par abonnement
 
 ## Installation
+
+⚠️ **Ne faites pas simplement `pip install -r requirements.txt`** — sur Windows, `face_recognition` déclare une dépendance sur le paquet `dlib` (à compiler depuis les sources, nécessite CMake + Visual Studio C++), même si `dlib-bin` (une version précompilée, sans compilation nécessaire) est installée. Pip ne fait pas le lien entre les deux et tente quand même de recompiler `dlib` depuis zéro → échec si Visual Studio n'est pas installé.
+
+**Faites plutôt, dans l'ordre, en 2 commandes :**
 ```bash
-pip install -r requirements.txt
+pip install opencv-python numpy pyserial Pillow dlib-bin face_recognition_models
+pip install face_recognition --no-deps
 ```
-Sur Windows, `dlib` (dépendance de `face_recognition`) demande souvent CMake + Visual Studio Build Tools.
-Le plus simple : `pip install cmake` puis `pip install dlib`, ou utiliser un environnement conda avec `conda install -c conda-forge dlib`.
+Le `--no-deps` sur la deuxième ligne est essentiel : il empêche pip de retélécharger/recompiler `dlib` puisque `dlib-bin` fait déjà le travail.
+
+Vérifiez que tout est bien installé :
+```bash
+python -c "import cv2, face_recognition, numpy, PIL; print('OK')"
+```
+
+*(`build_all.bat`, decrit plus bas, fait deja tout ca automatiquement dans le bon ordre.)*
 
 ## Utilisation
 
