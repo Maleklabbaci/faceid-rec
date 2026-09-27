@@ -10,6 +10,7 @@ import os
 import traceback
 
 from db import init_db, add_member, update_subscription, get_all_members, get_base_dir
+from liveness import LivenessTracker, compute_ear_from_landmarks
 
 # ----------------------------------------------------------------------------
 # Configuration
@@ -17,6 +18,7 @@ from db import init_db, add_member, update_subscription, get_all_members, get_ba
 USE_ARDUINO = False
 ARDUINO_PORT = "COM3"
 TOLERANCE = 0.5
+REQUIRE_BLINK = True  # Anti-spoofing : exige un clignement des yeux avant d'ouvrir l'accès
 
 # Certains pilotes de webcam (surtout via le backend DirectShow / CAP_DSHOW sous
 # Windows) renvoient un flux dont les lignes sont stockees "bottom-up", ce qui
@@ -76,6 +78,8 @@ class Theme:
     warning_soft = "#FEF3E2"
     neutral = "#6B7280"
     neutral_soft = "#EEF0F4"
+    info = "#2563EB"
+    info_soft = "#EAF1FE"
 
     font_family = "Segoe UI"
 
@@ -141,6 +145,7 @@ class App(tk.Tk):
         self.last_notified_id = None
         self.nav_buttons = {}
         self.active_view = "members"
+        self.liveness_tracker = LivenessTracker()
 
         self.reload_members()
         self.build_layout()
@@ -492,6 +497,7 @@ class App(tk.Tk):
             "danger": (Theme.danger, Theme.danger_soft),
             "warning": (Theme.warning, Theme.warning_soft),
             "neutral": (Theme.neutral, Theme.neutral_soft),
+            "info": (Theme.info, Theme.info_soft),
         }
         fg, bg = palette.get(kind, palette["neutral"])
         label.configure(text=text, fg=fg, bg=bg)
@@ -499,9 +505,11 @@ class App(tk.Tk):
     def process_recognition(self, frame):
         small = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
         rgb_small = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+        rgb_full = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         locations = face_recognition.face_locations(rgb_small)
         encodings = face_recognition.face_encodings(rgb_small, locations)
 
+        known_ids = [m["id"] for m in self.members]
         known_encodings = [m["encoding"] for m in self.members]
         known_names = [m["name"] for m in self.members]
         known_subs = [m["subscription_end"] for m in self.members]
@@ -521,15 +529,31 @@ class App(tk.Tk):
                     if matches[idx]:
                         name = known_names[idx]
                         if datetime.now() <= datetime.strptime(known_subs[idx], "%Y-%m-%d"):
-                            status_text = f"{name.upper()} - ACCES AUTORISE"
-                            status_kind = "success"
-                            color = (0, 200, 90)
-                            if arduino:
-                                arduino.write(b"OPEN\n")
+                            if REQUIRE_BLINK:
+                                ear = compute_ear_from_landmarks(rgb_full, (top, right, bottom, left))
+                                verified, remaining = self.liveness_tracker.update(known_ids[idx], ear)
+                                if verified:
+                                    status_text = f"{name.upper()} - ACCES AUTORISE"
+                                    status_kind = "success"
+                                    color = (0, 200, 90)
+                                    if arduino:
+                                        arduino.write(b"OPEN\n")
+                                else:
+                                    status_text = f"{name.upper()} - CLIGNEZ DES YEUX POUR VERIFIER ({int(remaining) + 1}s)"
+                                    status_kind = "info"
+                                    color = (235, 149, 34)
+                            else:
+                                status_text = f"{name.upper()} - ACCES AUTORISE"
+                                status_kind = "success"
+                                color = (0, 200, 90)
+                                if arduino:
+                                    arduino.write(b"OPEN\n")
                         else:
                             status_text = f"{name.upper()} - ABONNEMENT EXPIRE"
                             status_kind = "warning"
                             color = (0, 165, 255)
+                            if REQUIRE_BLINK:
+                                self.liveness_tracker.reset(known_ids[idx])
                     else:
                         status_text, status_kind = "ACCES REFUSE", "danger"
                 else:
@@ -540,6 +564,9 @@ class App(tk.Tk):
 
             if current_id is None:
                 current_id = name  # on ne notifie que pour le premier visage detecte
+
+        if REQUIRE_BLINK:
+            self.liveness_tracker.cleanup()
 
         if current_id is None:
             self.last_notified_id = None

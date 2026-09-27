@@ -3,11 +3,13 @@ import face_recognition
 import numpy as np
 from datetime import datetime
 from db import init_db, get_all_members
+from liveness import LivenessTracker, compute_ear_from_landmarks
 
 # --- Config ---
 USE_ARDUINO = False          # Mettre True si un relais Arduino est branché
 ARDUINO_PORT = "COM3"        # ou "/dev/ttyUSB0" sur Linux
 TOLERANCE = 0.5
+REQUIRE_BLINK = True         # Anti-spoofing : exige un clignement des yeux avant d'ouvrir l'accès
 
 arduino = None
 if USE_ARDUINO:
@@ -29,9 +31,12 @@ members = get_all_members()
 if not members:
     print("[ATTENTION] Aucun membre enregistré. Lancez register.py d'abord.")
 
+known_ids = [m["id"] for m in members]
 known_encodings = [m["encoding"] for m in members]
 known_names = [m["name"] for m in members]
 known_subs = [m["subscription_end"] for m in members]
+
+liveness_tracker = LivenessTracker()
 
 video = cv2.VideoCapture(0)
 print("[INFO] Caméra active. Appuyez sur 'q' pour quitter.")
@@ -43,6 +48,7 @@ while True:
 
     small = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
     rgb_small = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+    rgb_full = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
     locations = face_recognition.face_locations(rgb_small)
     encodings = face_recognition.face_encodings(rgb_small, locations)
@@ -60,15 +66,30 @@ while True:
                 if matches[idx]:
                     name = known_names[idx]
                     if check_subscription(known_subs[idx]):
-                        status, color = f"{name.upper()} - ACCES AUTORISE", (0, 255, 0)
-                        open_access()
+                        if REQUIRE_BLINK:
+                            ear = compute_ear_from_landmarks(rgb_full, (top, right, bottom, left))
+                            verified, remaining = liveness_tracker.update(known_ids[idx], ear)
+                            if verified:
+                                status, color = f"{name.upper()} - ACCES AUTORISE", (0, 255, 0)
+                                open_access()
+                            else:
+                                status = f"{name.upper()} - CLIGNEZ DES YEUX ({int(remaining) + 1}s)"
+                                color = (255, 190, 0)
+                        else:
+                            status, color = f"{name.upper()} - ACCES AUTORISE", (0, 255, 0)
+                            open_access()
                     else:
                         status, color = f"{name.upper()} - ABONNEMENT EXPIRE", (0, 165, 255)
+                        if REQUIRE_BLINK:
+                            liveness_tracker.reset(known_ids[idx])
 
         cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
         cv2.rectangle(frame, (left, bottom - 35), (right, bottom), color, cv2.FILLED)
         cv2.putText(frame, status, (left + 6, bottom - 6),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+    if REQUIRE_BLINK:
+        liveness_tracker.cleanup()
 
     cv2.imshow("Face ID - Controle d'acces", frame)
     if cv2.waitKey(1) & 0xFF == ord("q"):

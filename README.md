@@ -47,7 +47,15 @@ Note : `members.db`, `photos/` et `error.log` sont créés dans `%APPDATA%\FaceI
 - **PC perso** : lancer `main.py` en tâche de fond, `open_access()` peut déverrouiller une session ou une app.
 - **Salle de jeux (accès physique)** : mettre `USE_ARDUINO = True` dans `main.py`, brancher un Arduino/ESP32 + relais électromécanique sur la gâche de porte. Le script envoie `OPEN\n` en série quand l'accès est autorisé.
 
+## Anti-spoofing (détection de clignement)
+Pour éviter qu'une simple photo (imprimée ou affichée sur un écran) suffise à ouvrir l'accès, l'app exige un **clignement des yeux** avant d'accorder l'accès à une personne reconnue et à jour de son abonnement.
+
+- Implémenté dans `liveness.py`, réutilisant uniquement les 68 points de repère du visage déjà fournis par `face_recognition`/`dlib` (pas de dépendance supplémentaire type MediaPipe).
+- Calcul du ratio EAR (*Eye Aspect Ratio*) sur chaque œil : il chute nettement le temps d'un clignement. Dès qu'un clignement est détecté, le badge passe de « CLIGNEZ DES YEUX POUR VÉRIFIER (Xs) » à « ACCÈS AUTORISÉ », et reste autorisé tant que la personne reste face caméra en continu.
+- Si la personne quitte le champ de la caméra puis revient, un nouveau clignement est redemandé.
+- Actif dans `app.py` (onglet Reconnaissance) et dans `main.py`. Peut être désactivé en mettant `REQUIRE_BLINK = False` en haut du fichier concerné.
+
 ## Pistes d'amélioration
-- Anti-spoofing (détection de clignement via MediaPipe) pour éviter le déverrouillage avec une photo.
 - Interface admin web pour gérer les membres/abonnements sans passer par `register.py`.
+- Historique des accès (logs horodatés + export CSV).
 - Renouvellement d'abonnement via `update_subscription()` dans `db.py`.
