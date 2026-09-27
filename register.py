@@ -13,6 +13,19 @@ name = input("Nom du membre : ").strip()
 sub_end = input("Date de fin d'abonnement (AAAA-MM-JJ) : ").strip()
 datetime.strptime(sub_end, "%Y-%m-%d")  # validation du format
 
+# --- Consentement (donnee biometrique - loi n 18-07) ---
+# Avant de stocker le visage de quelqu'un, il faut son accord explicite.
+# Utilisez docs/formulaire_consentement.md pour le faire signer sur papier,
+# puis confirmez ici que c'est fait.
+print("\nDonnee biometrique : le visage de cette personne va etre enregistre.")
+print("Assurez-vous d'avoir fait signer le formulaire de consentement")
+print("(voir docs/formulaire_consentement.md) avant de continuer.")
+consent_input = input("La personne a-t-elle donne son consentement signe ? (oui/non) : ").strip().lower()
+consent = consent_input in ("oui", "o", "yes", "y")
+if not consent:
+    print("[ANNULE] Consentement non confirme : aucun enregistrement effectue.")
+    raise SystemExit(0)
+
 cam = cv2.VideoCapture(0)
 print("[INFO] Placez-vous face à la caméra. Appuyez sur ESPACE pour capturer, ECHAP pour annuler.")
 
@@ -42,7 +55,7 @@ cam.release()
 cv2.destroyAllWindows()
 
 if encoding is not None:
-    add_member(name, encoding, sub_end, photo_path)
+    add_member(name, encoding, sub_end, photo_path, consent=True)
     print(f"[OK] {name} enregistré avec abonnement jusqu'au {sub_end}.")
 else:
     print("[ANNULE] Aucun membre enregistré.")

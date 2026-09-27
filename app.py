@@ -326,10 +326,10 @@ class App(tk.Tk):
         list_card = self.make_card(body)
         list_card.outer.pack(fill="both", expand=True)
 
-        cols = ("id", "name", "sub_end")
+        cols = ("id", "name", "sub_end", "consent")
         self.tree = ttk.Treeview(list_card, columns=cols, show="headings", style="Faceid.Treeview")
-        headings = {"id": "ID", "name": "Nom", "sub_end": "Fin d'abonnement"}
-        widths = {"id": 70, "name": 320, "sub_end": 200}
+        headings = {"id": "ID", "name": "Nom", "sub_end": "Fin d'abonnement", "consent": "Consentement"}
+        widths = {"id": 70, "name": 300, "sub_end": 180, "consent": 130}
         for c in cols:
             self.tree.heading(c, text=headings[c])
             self.tree.column(c, width=widths[c], anchor="w")
@@ -367,7 +367,9 @@ class App(tk.Tk):
             self.tree.delete(*self.tree.get_children())
             for i, m in enumerate(self.members):
                 tag = "even" if i % 2 == 0 else "odd"
-                self.tree.insert("", "end", iid=m["id"], values=(m["id"], m["name"], m["subscription_end"]),
+                consent_label = "Oui" if m.get("consent_given") else "Non renseigne"
+                self.tree.insert("", "end", iid=m["id"],
+                                  values=(m["id"], m["name"], m["subscription_end"], consent_label),
                                   tags=(tag,))
 
     def renew_selected(self):
@@ -422,7 +424,20 @@ class App(tk.Tk):
         tk.Label(form_inner, text="Fin d'abonnement (AAAA-MM-JJ)", bg=Theme.bg_card, fg=Theme.text_muted,
                  font=(Theme.font_family, 9)).pack(anchor="w")
         self.date_entry = ttk.Entry(form_inner, style="Faceid.TEntry")
-        self.date_entry.pack(fill="x", pady=(4, 22))
+        self.date_entry.pack(fill="x", pady=(4, 14))
+
+        # Consentement obligatoire avant tout enregistrement d'une donnee
+        # biometrique (visage) - voir docs/formulaire_consentement.md et
+        # loi algerienne n 18-07 sur la protection des donnees personnelles.
+        self.consent_var = tk.BooleanVar(value=False)
+        consent_check = tk.Checkbutton(
+            form_inner,
+            text="La personne a signe le formulaire de consentement\n(stockage de son visage)",
+            variable=self.consent_var, bg=Theme.bg_card, fg=Theme.text_main,
+            activebackground=Theme.bg_card, font=(Theme.font_family, 9),
+            anchor="w", justify="left", wraplength=220,
+        )
+        consent_check.pack(fill="x", pady=(0, 18), anchor="w")
 
         capture_btn = tk.Button(form_inner, text="📸  Capturer & enregistrer", command=self.capture_member)
         style_button(capture_btn, Theme.accent, "white", Theme.accent_hover)
@@ -444,6 +459,14 @@ class App(tk.Tk):
         except ValueError:
             messagebox.showerror("Erreur", "Format de date invalide (AAAA-MM-JJ).")
             return
+        if not self.consent_var.get():
+            messagebox.showwarning(
+                "Consentement requis",
+                "Vous devez cocher la case confirmant que la personne a signe\n"
+                "le formulaire de consentement avant d'enregistrer son visage\n"
+                "(donnee biometrique - voir docs/formulaire_consentement.md).",
+            )
+            return
         if self.last_frame is None:
             messagebox.showerror("Erreur", "Pas de flux camera.")
             return
@@ -454,10 +477,11 @@ class App(tk.Tk):
             messagebox.showerror("Erreur", "Aucun visage detecte.")
             return
 
-        add_member(name, encs[0], date_str)
+        add_member(name, encs[0], date_str, consent=True)
         messagebox.showinfo("OK", f"{name} enregistre jusqu'au {date_str}.")
         self.name_entry.delete(0, "end")
         self.date_entry.delete(0, "end")
+        self.consent_var.set(False)
         self.reload_members()
 
     # ================= Vue : Reconnaissance =================

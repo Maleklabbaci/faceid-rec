@@ -47,6 +47,14 @@ Note : `members.db`, `photos/` et `error.log` sont créés dans `%APPDATA%\FaceI
 - **PC perso** : lancer `main.py` en tâche de fond, `open_access()` peut déverrouiller une session ou une app.
 - **Salle de jeux (accès physique)** : mettre `USE_ARDUINO = True` dans `main.py`, brancher un Arduino/ESP32 + relais électromécanique sur la gâche de porte. Le script envoie `OPEN\n` en série quand l'accès est autorisé.
 
+## Vendre / déployer FaceID (Algérie)
+Le dossier `docs/` contient de quoi démarcher des clients en toute légalité :
+- `docs/argumentaire_vente.md` — argumentaire prêt à présenter (salles de sport, salles de jeux, coworking, écoles, résidences...).
+- `docs/formulaire_consentement.md` — formulaire papier à faire signer avant d'enregistrer le visage de quelqu'un.
+- `docs/conformite_donnees.md` — checklist de conformité (loi n° 18-07, ANPDP) et bonnes pratiques de sécurité.
+
+Le logiciel exige désormais une confirmation de consentement (case à cocher dans `app.py`, question dans `register.py`) avant d'enregistrer le visage d'un membre, et garde une trace (`consent_given`, `consent_date`) en base.
+
 ## Anti-spoofing (détection de clignement)
 Pour éviter qu'une simple photo (imprimée ou affichée sur un écran) suffise à ouvrir l'accès, l'app exige un **clignement des yeux** avant d'accorder l'accès à une personne reconnue et à jour de son abonnement.
 
