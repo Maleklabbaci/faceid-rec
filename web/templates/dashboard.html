@@ -92,7 +92,8 @@
         <div class="chart">
           {% for c in chart %}
             <div class="bar-wrap">
-              <div class="bar" style="height: {{ (c.count / chart_max * 100)|round|int }}%"><span>{{ c.count }}</span></div>
+              {# height is applied from app.js: `style-src 'self'` refuses inline style attributes #}
+              <div class="bar" data-height="{{ (c.count / chart_max * 100)|round|int }}"><span>{{ c.count }}</span></div>
               <small>{{ c.day }}</small>
             </div>
           {% endfor %}
@@ -115,7 +116,7 @@
           <span class="date-group">
             <label class="sr-only" for="new-end">{{ s.access }} jusqu'au</label>
             <input type="date" id="new-end" name="subscription_end" required value="{{ today }}" title="{{ s.access }} jusqu'au">
-            <span class="quick-dates" data-target="new-end">
+            <span class="quick-dates" data-target="new-end" data-today="{{ today }}">
               <button type="button" class="chip" data-days="0">Journée</button>
               <button type="button" class="chip" data-months="1">1 mois</button>
               <button type="button" class="chip" data-months="3">3 mois</button>

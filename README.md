@@ -20,7 +20,9 @@ site/vendor/face-api.js    moteur facial navigateur (détection + empreinte 128-
 site/models/               poids des 3 réseaux (≈ 6,5 Mo, mis en cache un an)
 functions/api/[[route]].js API JSON : comptes, membres, enrôlement, reconnaissance, règles secteur, journal
 schema.sql                 schéma D1 (créé automatiquement au premier appel)
-tests/cloudflare.test.mjs  8 tests de bout en bout (npm test)
+tests/cloudflare.test.mjs  10 tests de bout en bout de l'API (npm test)
+tests/ui-flow.test.mjs     14 tests « vrai navigateur » : formulaires login/inscription,
+                           session, tableau de bord, capture, kiosque (npm run test:ui)
 ```
 
 Réglages du projet Pages : *Build output directory* = `site`, base D1 `faceid` liée sous le nom **`DB`**, secret **`PEPPER`**, branche de production `main`. Détail pas à pas, dépannage de l'erreur SSL des URL de prévisualisation, domaine personnalisé : **[deploy/cloudflare-pages.md](deploy/cloudflare-pages.md)**.
@@ -28,6 +30,8 @@ Réglages du projet Pages : *Build output directory* = `site`, base D1 `faceid` 
 ```bash
 npm install && npm run dev     # http://localhost:8788 avec une base D1 locale
 npm test                       # tests API (démarre un serveur wrangler local)
+npm run test:ui                # les pages jouées dans un DOM (jsdom) contre le serveur réel
+npm run test:all               # les deux suites
 ```
 
 Comment la reconnaissance fonctionne sans serveur : le kiosque calcule l'empreinte du visage dans le navigateur, la compare aux empreintes des membres de l'entreprise (téléchargées via `GET /api/descriptors`, consentement requis) et n'envoie que la décision (`POST /api/recognized`) ; l'API applique les règles (expiration, un repas/jour, retards, doublons 60 s) et tient le journal. Aucune image ne transite sur Internet.
@@ -40,9 +44,10 @@ Comment la reconnaissance fonctionne sans serveur : le kiosque calcule l'emprein
 ```bash
 python -m venv .venv && source .venv/bin/activate      # Windows : .venv\Scripts\activate
 pip install -r requirements-web.txt
-COOKIE_SECURE=0 python -m web.wsgi                      # http://localhost:5000
+python -m web.wsgi                                       # http://localhost:5000
 ```
-`COOKIE_SECURE=0` n'est nécessaire qu'en HTTP local. En production (HTTPS) ne le mettez pas.
+Le cookie de session s'adapte tout seul : `Secure` en HTTPS, absent en HTTP (sinon le navigateur
+le jette et la connexion boucle sur /login). Forcer manuellement avec `COOKIE_SECURE=0` ou `=1`.
 
 ### Moteur facial (le même que l'application bureau)
 ```bash
@@ -86,8 +91,12 @@ Mots de passe hachés (Werkzeug), jeton CSRF sur tous les POST, cookies `HttpOnl
 
 ### Tests
 ```bash
-pip install pytest && python -m pytest -q tests
+pip install pytest && python -m pytest -q tests   # édition Flask
+npm install && npm run test:all                   # édition Cloudflare (API + DOM)
 ```
+Les suites couvrent aussi les pièges déjà corrigés : cookie `Secure` rejeté en HTTP, attributs
+`style=` refusés par la CSP (graphique vide), budgets de tentatives qui punitaient les fautes
+de frappe, dates calculées en UTC (« Journée » donnait la veille).
 
 ### Mettre en ligne l'édition auto-hébergée — avec Cloudflare Tunnel
 Cette édition exécute le moteur facial natif (dlib) côté serveur ; **Cloudflare Tunnel** (gratuit) donne une URL HTTPS sur ton domaine à une app qui tourne sur ton PC ou un VPS, sans ouvrir de port. Tout est prêt :
@@ -99,7 +108,7 @@ Guide complet (VPS Docker, PC Windows sans Docker, test express `trycloudflare.c
 
 Autres hébergeurs Python (Render, Railway, Fly.io, VPS + Nginx) : même image Docker ou `gunicorn --preload -w 2 -b 0.0.0.0:$PORT web.wsgi:app`.
 
-Variables : `SECRET_KEY` (**obligatoire**), `WEB_DATABASE` (sur disque persistant ; la clé de session générée est stockée à côté), `TRUST_PROXY=1` derrière un proxy, `PRELOAD_FACE=1`, `COOKIE_SECURE=0` seulement en HTTP local. Supervision : `GET /healthz`.
+Variables : `SECRET_KEY` (**obligatoire**), `WEB_DATABASE` (sur disque persistant ; la clé de session générée est stockée à côté), `TRUST_PROXY=1` derrière un proxy, `PRELOAD_FACE=1`, `COOKIE_SECURE=auto` par défaut (suit le schéma de chaque requête). Supervision : `GET /healthz`.
 
 Base SQLite = suffisant pour démarrer et les premiers clients. Prévoir PostgreSQL au-delà (quelques dizaines d'entreprises actives en même temps).
 

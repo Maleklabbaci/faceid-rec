@@ -138,9 +138,28 @@ function cookieValue(request, name) {
   return null;
 }
 
-function sessionCookie(token, maxAge, env) {
+// Browsers only accept a `Secure` cookie inside a secure context. A kiosk opened through
+// plain HTTP on a LAN address (http://192.168.1.20:8788) is not one, so a forced `Secure`
+// flag makes the browser silently drop the session: signup answers 200, then /app bounces
+// back to /login forever. Loopback and HTTPS stay secure.
+function isSecureRequest(request) {
+  if ((request.headers.get("x-forwarded-proto") || "").split(",")[0].trim() === "https") return true;
+  const url = new URL(request.url);
+  if (url.protocol === "https:") return true;
+  return /^(localhost$|127\.|::1$|\[::1\]$)/.test(url.hostname);
+}
+
+function cookieOptions(env, request) {
+  return { secure: isSecureRequest(request), embed: Boolean(env && env.EMBED_PREVIEW) };
+}
+
+function sessionCookie(token, maxAge, { secure = true, embed = false } = {}) {
   // EMBED_PREVIEW=1 (local demos inside a third-party iframe only) relaxes SameSite; never set it in production.
-  return `sid=${token}; Path=/; HttpOnly; Secure; SameSite=${env && env.EMBED_PREVIEW ? "None" : "Lax"}; Max-Age=${maxAge}`;
+  const parts = [`sid=${token}`, "Path=/", "HttpOnly"];
+  if (embed && secure) parts.push("SameSite=None", "Secure"); // SameSite=None is refused without Secure
+  else { if (secure) parts.push("Secure"); parts.push("SameSite=Lax"); }
+  parts.push(`Max-Age=${maxAge}`);
+  return parts.join("; ");
 }
 
 function localParts(timezone, date = new Date()) {
@@ -170,6 +189,15 @@ function validDate(value) {
 
 function clientIp(request) {
   return request.headers.get("CF-Connecting-IP") || "local";
+}
+
+// Behind Cloudflare every visitor has a distinct IP. Without it — `wrangler pages dev`,
+// the test suite, a demo on a kiosk LAN — everyone shares one bucket, so the budgets are
+// widened: a demo must not lock itself out of the signup page after five accounts.
+function limitsFor(request) {
+  return request.headers.get("CF-Connecting-IP")
+    ? { signup: 5, loginAccount: 10, loginIp: 60 }
+    : { signup: 60, loginAccount: 100, loginIp: 600 };
 }
 
 async function limited(env, key, max, windowSeconds) {
@@ -215,12 +243,12 @@ async function currentUser(env, request) {
   return row;
 }
 
-async function startSession(env, userId) {
+async function startSession(env, userId, request) {
   const token = b64url(randomBytes(32));
   const id = await sha256hex(token);
   const maxAge = SESSION_DAYS * 86400;
   await env.DB.prepare("INSERT INTO sessions(id,user_id,expires_at) VALUES(?,?,?)").bind(id, userId, Date.now() + maxAge * 1000).run();
-  return sessionCookie(token, maxAge, env);
+  return sessionCookie(token, maxAge, cookieOptions(env, request));
 }
 
 async function memberOf(env, user, memberId) {
@@ -268,35 +296,52 @@ function entryMessage(sector, name, result) {
 // ---------------------------------------------------------------------------
 async function signup(env, request) {
   assertSameOrigin(request);
-  await limited(env, `signup:${clientIp(request)}`, 5, 3600);
   const body = await readJson(request);
   const name = String(body.company || "").trim();
   const email = String(body.email || "").trim().toLowerCase();
   const password = String(body.password || "");
   const sector = body.sector;
   if (!name || name.length > 100 || !email.includes("@") || email.length > 254 || password.length < 12 || password.length > 256 || !SECTORS[sector]) {
+    // Rejected before the rate limiter is consumed: a typo must not lock a legitimate
+    // customer out of the signup page for the next hour.
     fail(400, "Vérifiez les champs. Le mot de passe doit contenir 12 à 256 caractères.");
   }
+  await limited(env, `signup:${clientIp(request)}`, limitsFor(request).signup, 3600);
   const exists = await env.DB.prepare("SELECT id FROM users WHERE email=?").bind(email).first();
   if (exists) fail(409, "Impossible de créer ce compte avec ces informations. Essayez de vous connecter.");
   const org = await env.DB.prepare("INSERT INTO organizations(name,sector,created_at) VALUES(?,?,?)").bind(name, sector, new Date().toISOString()).run();
-  const user = await env.DB.prepare("INSERT INTO users(org_id,email,password) VALUES(?,?,?)").bind(org.meta.last_row_id, email, await hashPassword(password, env)).run();
-  const cookie = await startSession(env, user.meta.last_row_id);
+  let user;
+  try {
+    user = await env.DB.prepare("INSERT INTO users(org_id,email,password) VALUES(?,?,?)").bind(org.meta.last_row_id, email, await hashPassword(password, env)).run();
+  } catch (err) {
+    // D1 has no cross-request transaction: undo the organization instead of leaving an
+    // orphan company behind when the unique email races another signup.
+    await env.DB.prepare("DELETE FROM organizations WHERE id=?").bind(org.meta.last_row_id).run().catch(() => {});
+    if (/UNIQUE constraint failed: users\.email/.test(String(err && err.message))) fail(409, "Impossible de créer ce compte avec ces informations. Essayez de vous connecter.");
+    throw err;
+  }
+  const cookie = await startSession(env, user.meta.last_row_id, request);
   return json({ ok: true, redirect: "/app" }, 200, { "Set-Cookie": cookie });
 }
 
 async function login(env, request) {
   assertSameOrigin(request);
-  await limited(env, `login:${clientIp(request)}`, 10, 300);
   const body = await readJson(request);
   const email = String(body.email || "").trim().toLowerCase();
+  const limits = limitsFor(request);
+  // Two buckets instead of one: guessing a known account is throttled per account *and* per
+  // visitor, so colleagues sharing one NAT address cannot lock each other out — 10 logins in
+  // 5 minutes is nothing for a hundred employees on Monday morning. Spraying many accounts
+  // from one address stays throttled by the second bucket.
+  await limited(env, `login:acct:${await sha256hex(email || "-")}:${clientIp(request)}`, limits.loginAccount, 300);
+  await limited(env, `login:ip:${clientIp(request)}`, limits.loginIp, 300);
   const row = await env.DB.prepare("SELECT id, password FROM users WHERE email=?").bind(email).first();
   const password = String(body.password || "");
   let ok = false;
   if (row) ok = await verifyPassword(password, row.password, env);
   else await verifyPassword(password, DUMMY_HASH, env); // same work whether or not the account exists
   if (!ok) fail(401, "Email ou mot de passe incorrect.");
-  const cookie = await startSession(env, row.id);
+  const cookie = await startSession(env, row.id, request);
   return json({ ok: true, redirect: "/app" }, 200, { "Set-Cookie": cookie });
 }
 
@@ -304,7 +349,7 @@ async function logout(env, request) {
   assertSameOrigin(request);
   const token = cookieValue(request, "sid");
   if (token) await env.DB.prepare("DELETE FROM sessions WHERE id=?").bind(await sha256hex(token)).run();
-  return json({ ok: true, redirect: "/" }, 200, { "Set-Cookie": sessionCookie("", 0, env) });
+  return json({ ok: true, redirect: "/" }, 200, { "Set-Cookie": sessionCookie("", 0, cookieOptions(env, request)) });
 }
 
 async function state(env, user) {

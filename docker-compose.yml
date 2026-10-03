@@ -15,7 +15,8 @@ services:
       - faceid-data:/data
     expose:
       - "5000"
-    # Uncomment to also reach the app on the local network without Cloudflare (e.g. http://PC-IP:5000, set COOKIE_SECURE=0):
+    # Uncomment to also reach the app on the local network without Cloudflare (http://PC-IP:5000):
+    # the session cookie adapts to the scheme, no COOKIE_SECURE setting needed for that.
     # ports:
     #   - "5000:5000"
 
