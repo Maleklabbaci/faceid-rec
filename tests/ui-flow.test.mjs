@@ -12,9 +12,16 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { SITE, env, uniq, today, LAN_IP, waitFor, startServer, stopServer, makeJar, raw, space, openPage, fill, flashOf, descriptorFor } from "./browser-harness.mjs";
 
+const PER_PAGE_TEST = 12;   // site/assets/app.js: douze lignes par page, jamais un mur de tableaux
 const PORT = 8791;
 let BASE = process.env.FACEID_URL || "";
 let handle = null;
+// Le poste live enchaîne des minuteurs — caméra qui se relance, direct, veilleur. Une fenêtre
+// laissée ouverte continuerait donc de les reprogrammer et empêcherait le processus de mourir.
+// Toute fenêtre ouverte ici est refermée à la fin du fichier, y compris sur une assertion qui échoue.
+const opened = [];
+const track = (ctx) => { opened.push(ctx); return ctx; };
+const closeIt = (ctx) => { ctx.close(); const i = opened.indexOf(ctx); if (i >= 0) opened.splice(i, 1); };
 let LAN_BASE = null;
 
 before(async () => {
@@ -27,10 +34,10 @@ before(async () => {
   LAN_BASE = env.LAN_BASE = LAN_IP ? `http://${LAN_IP}:${new URL(BASE).port || PORT}` : null;
 });
 
-after(() => stopServer(handle));
+after(() => { for (const ctx of opened) { try { ctx.close(); } catch (_) { /* déjà refermée */ } } stopServer(handle); });
 
 test("landing page: every link it advertises resolves, including login and signup", async () => {
-  const ctx = await openPage("/", makeJar());
+  const ctx = track(await openPage("/", makeJar()));
   const links = [...ctx.document.querySelectorAll("a")].map((a) => a.getAttribute("href"));
   for (const href of ["/login", "/signup"]) assert.ok(links.includes(href), `${href} is linked from the landing page`);
   for (const href of [...new Set(links.filter((h) => h && h.startsWith("/") && !h.includes("#")))]) {
@@ -42,7 +49,7 @@ test("landing page: every link it advertises resolves, including login and signu
 test("signup form creates the company space and hands the browser over to the app", async () => {
   const jar = makeJar();
   const email = `signup-${uniq()}@example.com`;
-  const ctx = await openPage("/signup", jar);
+  const ctx = track(await openPage("/signup", jar));
   const form = ctx.document.getElementById("auth-form");
   assert.equal(form.dataset.endpoint, "/api/signup", "the form posts to the signup endpoint");
   await fill(ctx, form, { company: "Salle UI " + uniq(), sector: "office", email: "  " + email.toUpperCase() + " ", password: "motdepasse-ui-123" });
@@ -63,7 +70,7 @@ test("signup form creates the company space and hands the browser over to the ap
 });
 
 test("signup form: the password rule is written in the markup and enforced on the server", async () => {
-  const ctx = await openPage("/signup", makeJar());
+  const ctx = track(await openPage("/signup", makeJar()));
   const password = ctx.document.querySelector('#auth-form input[name="password"]');
   assert.equal(password.getAttribute("minlength"), "12", "the browser itself refuses a shorter password");
   assert.equal(password.getAttribute("autocomplete"), "new-password", "the password manager offers a fresh password, not a saved one");
@@ -76,7 +83,7 @@ test("signup form: the password rule is written in the markup and enforced on th
 
 test("signup form: an email already taken is refused with a hint to log in", async () => {
   const { email } = await space("fitness");
-  const ctx = await openPage("/signup", makeJar());
+  const ctx = track(await openPage("/signup", makeJar()));
   await fill(ctx, ctx.document.getElementById("auth-form"), { company: "Doublon", sector: "fitness", email, password: "motdepasse-doublon-12" });
   const flash = flashOf(ctx);
   assert.equal(flash.hidden, false);
@@ -87,14 +94,14 @@ test("signup form: an email already taken is refused with a hint to log in", asy
 });
 
 test("signup form: the sector preselected on the landing page is kept", async () => {
-  const ctx = await openPage("/signup?sector=canteen", makeJar());
+  const ctx = track(await openPage("/signup?sector=canteen", makeJar()));
   assert.equal(ctx.document.getElementById("sector-select").value, "canteen", "?sector=… preselects the sector");
 });
 
 test("login form: a wrong password explains itself, the right one opens the space", async () => {
   const { email, password } = await space("office");
   const jar = makeJar();
-  const ctx = await openPage("/login", jar);
+  const ctx = track(await openPage("/login", jar));
   const form = ctx.document.getElementById("auth-form");
   assert.equal(form.dataset.endpoint, "/api/login");
 
@@ -130,7 +137,7 @@ test("a kiosk reached over plain HTTP keeps its session", async (t) => {
   assert.equal((await raw("/api/state", { jar, base: LAN_BASE })).status, 200, "the session authenticates over plain HTTP");
 
   jar.forget("sid"); // a returning visitor, back at the login form
-  const ctx = await openPage("/login", jar, { base: LAN_BASE });
+  const ctx = track(await openPage("/login", jar, { base: LAN_BASE }));
   await fill(ctx, ctx.document.getElementById("auth-form"), { email, password: "motdepasse-lan-123" });
   assert.equal(ctx.calls[0].status, 200);
   assert.deepEqual(jar.dropped(), [], "the login cookie survived as well");
@@ -143,7 +150,7 @@ test("logout invalidates the session everywhere", async () => {
   const jar = makeJar();
   assert.equal((await raw("/api/login", { body: { email, password }, jar })).status, 200);
   assert.equal((await raw("/api/state", { jar })).status, 200);
-  const ctx = await openPage("/app", jar);
+  const ctx = track(await openPage("/app", jar));
   ctx.document.getElementById("logout").click();
   await ctx.flush();
   assert.ok(ctx.calls.some((c) => c.path === "/api/logout"), "the logout was posted");
@@ -155,16 +162,17 @@ test("logout invalidates the session everywhere", async () => {
 // The app shell
 // ---------------------------------------------------------------------------
 test("/app without a session is sent back to the login page", async () => {
-  const ctx = await openPage("/app", makeJar());
+  const ctx = track(await openPage("/app", makeJar()));
   assert.deepEqual(ctx.calls.map((c) => c.path), ["/api/state"]);
   assert.equal(ctx.calls[0].status, 401);
   assert.equal(ctx.navigations.length, 1, "a redirect to /login is attempted");
   assert.match(ctx.document.getElementById("page").textContent, /Chargement/, "no private data is rendered meanwhile");
+  closeIt(ctx);
 });
 
 test("a logged-in browser renders the dashboard of its own company", async () => {
   const { jar } = await space("office");
-  const ctx = await openPage("/app", jar);
+  const ctx = track(await openPage("/app", jar));
   const doc = ctx.document;
   assert.match(doc.getElementById("org-name").textContent, /^Espace office /);
   assert.match(doc.getElementById("user-email").textContent, /@example\.com$/);
@@ -181,11 +189,12 @@ test("a logged-in browser renders the dashboard of its own company", async () =>
   assert.equal(/style-src[^;]*unsafe-inline/.test(csp), false, "the policy keeps inline styles refused");
   assert.deepEqual(ctx.inlineStyles, [], "no JS-rendered markup tries to use an inline style attribute");
   assert.equal(ctx.errors.length, 0, "the app page is clean: " + ctx.errors.join(" | "));
+  closeIt(ctx);
 });
 
 test("members: add a person, quick dates stay on the company calendar, capture, renew, delete", async () => {
   const { jar } = await space("office");
-  const ctx = await openPage("/app", jar);
+  const ctx = track(await openPage("/app", jar));
   const doc = ctx.document;
   doc.defaultView.location.hash = "members";
   await ctx.flush();
@@ -252,7 +261,7 @@ test("members: add a person, quick dates stay on the company calendar, capture, 
 
 test("settings: the space follows its own settings, invalid values are refused", async () => {
   const { jar } = await space("office");
-  const ctx = await openPage("/app", jar);
+  const ctx = track(await openPage("/app", jar));
   const doc = ctx.document;
   doc.defaultView.location.hash = "settings";
   await ctx.flush();
@@ -270,69 +279,232 @@ test("settings: the space follows its own settings, invalid values are refused",
   assert.equal((await raw("/api/settings", { body: { company: "X", sector: "office", timezone: "Mars/Olympus", work_start: "08:30", late_tolerance: 10 }, jar })).status, 400, "an unknown timezone is refused");
   assert.equal((await raw("/api/settings", { body: { company: "X", sector: "office", timezone: "UTC", work_start: "25:71", late_tolerance: 10 }, jar })).status, 400, "a nonsense hour is refused");
   assert.equal(ctx.errors.length, 0, "the settings page is clean: " + ctx.errors.join(" | "));
+  closeIt(ctx);
 });
 
-test("the kiosk page starts the camera, matches in the browser and logs the passage", async () => {
+test("the camera of the space starts itself, matches in the browser and logs the passage", async () => {
   const { jar } = await space("fitness");
-  // a member with a face, enrolled before the kiosk opens so the browser feed holds it
+  // a member with a face, enrolled before the camera opens so the browser feed holds it
   const name = "Sara " + uniq();
-  const companyToday = (await raw("/api/state", { jar })).data.today; // the kiosk's own calendar day
+  const companyToday = (await raw("/api/state", { jar })).data.today;
   const member = (await raw("/api/members", { body: { name, subscription_end: companyToday }, jar })).data;
   assert.equal((await raw(`/api/members/${member.id}/enroll`, { body: { consent: true, descriptor: descriptorFor(7) }, jar })).status, 200);
   const known = await raw("/api/descriptors", { jar });
   assert.equal(known.data.members.length, 1, "the browser feed holds exactly one face");
 
-  const ctx = await openPage("/app", jar, { faceState: { loads: 0, faces: [], box: { x: 0, y: 0, width: 300, height: 400 } } });
+  const ctx = track(await openPage("/app", jar, { faceState: { loads: 0, faces: [], box: { x: 0, y: 0, width: 300, height: 400 } } }));
   const doc = ctx.document;
   doc.defaultView.location.hash = "access";
-  await ctx.flush();
-  assert.ok(doc.getElementById("rec-video"), "the kiosk video surface exists");
-  assert.equal(doc.getElementById("rec-check").disabled, true, "verification stays off until the camera runs");
-  assert.match(doc.getElementById("rec-banner-title").textContent, /Caméra inactive/);
+  await ctx.flush(14, 40);
 
-  doc.getElementById("rec-start").click();
-  await ctx.flush();
-  assert.equal(ctx.state.loads, 1, "the facial engine was loaded once");
-  assert.equal(doc.getElementById("rec-check").disabled, false, "manual verification unlocked");
-  assert.equal(doc.getElementById("rec-auto").disabled, false, "kiosk mode unlocked");
-  assert.match(doc.getElementById("rec-status").textContent, /1 visage\(s\) connus/, "the status tells how many faces are known");
+  // Personne n'appuie sur « Activer la caméra » : le poste s'allume, charge le moteur, et le dit.
+  const video = doc.getElementById("rec-video");
+  assert.ok(video, "the live dock carries the video surface");
+  assert.equal(ctx.state.loads, 1, "the facial engine was loaded once, without a single click");
+  assert.equal(doc.getElementById("rec-check").disabled, false, "verification is ready from the start");
+  assert.ok(doc.getElementById("rec-auto").checked, "auto mode is on, and stays on");
+  assert.match(doc.getElementById("rec-banner-title").textContent, /En attente d'un visage/, "a free camera says it is waiting for a face");
+  assert.ok(doc.querySelector(".dot-live.on"), "the post is marked live, here and in the top bar");
+  assert.match(doc.getElementById("bar-cam-text").textContent, /Cam\u00e9ra active/);
 
+  // un cadre vide, comme un visage inconnu, ne coûtent aucun appel au serveur
   ctx.calls.length = 0;
-  doc.getElementById("rec-check").click();
-  await ctx.flush();
-  assert.match(doc.getElementById("rec-banner-title").textContent, /En attente d'un visage/, "an empty frame says so");
-  assert.equal(ctx.calls.length, 0, "…without costing an API call");
-
-  ctx.state.faces = [descriptorFor(42)]; // a stranger
-  doc.getElementById("rec-check").click();
-  await ctx.flush();
+  await ctx.flush(6, 40);
+  assert.equal(ctx.calls.filter((c) => ["/api/recognized", "/api/entry", "/api/descriptors"].includes(c.path)).length, 0, "an empty frame never talks to the API");
+  ctx.state.faces = [Array.from({ length: 128 }, (_, i) => (i % 2 ? 0.09 : -0.09))];
+  await ctx.flush(8, 40);
   assert.match(doc.getElementById("rec-banner-title").textContent, /VISAGE INCONNU/);
-  assert.equal(ctx.calls.length, 0, "an unmatched face never reaches the API");
+  assert.equal(ctx.calls.filter((c) => c.path === "/api/recognized").length, 0, "an unmatched face never reaches the API");
 
-  ctx.state.faces = [known.data.members[0].d]; // the member, seen through the same camera
+  // la personne enregistrée : le verdict arrive, en fiche comme en journal
+  ctx.state.faces = [known.data.members[0].d];
   doc.getElementById("rec-check").click();
-  await ctx.flush();
-  assert.match(doc.getElementById("rec-banner-title").textContent, /ACCÈS AUTORISÉ/, "the banner welcomes the member back");
+  await ctx.flush(12, 40);
+  assert.match(doc.getElementById("rec-banner-title").textContent, /ACCÈS AUTORIS\u00c9/, "the banner welcomes the member back");
   assert.equal(ctx.calls.find((c) => c.path === "/api/recognized").status, 200, "the browser sent the decision, the server logged it");
   assert.match(doc.querySelector(".live-list li").textContent, new RegExp(name.split(" ")[0]), "the live list shows the passage");
   assert.match(doc.getElementById("access-journal").textContent, /Sara/, "the journal below picked the passage up");
-  assert.equal(ctx.errors.length, 0, "the kiosk is clean: " + ctx.errors.join(" | "));
+  const card = doc.querySelector('.toasts [data-verdict="granted"]');
+  assert.ok(card, "a passage raises a notification card, not a plain banner");
+  assert.match(card.textContent, /Sara/, "the card names the person");
+  assert.ok(card.querySelector(".toast-icon svg"), "with its own icon");
+  assert.ok(card.querySelector(".toast-close"), "and a way to close it");
 
-  doc.getElementById("rec-start").click(); // cut the camera again
-  await ctx.flush();
-  assert.match(doc.getElementById("rec-banner-title").textContent, /Caméra inactive/, "and the camera really stops");
+  // la caméra suit l'écran : le flux n'est jamais coupé ni relancé par une navigation
+  doc.defaultView.location.hash = "overview";
+  await ctx.flush(8, 40);
+  assert.equal(doc.getElementById("rec-video"), video, "the same video node travelled to the dashboard: the stream was never re-opened");
+  assert.ok(doc.querySelector("#page .live-dock"), "and it is shown there, compactly");
+  assert.match(video.srcObject ? "live" : "", /live/, "the MediaStream is still attached while browsing the space");
+  assert.equal(ctx.state.loads, 1, "the engine was not loaded a second time either");
+
+  // « Mettre en pause » n'éteint plus un poste : c'est une minute, puis il repart seul
+  doc.defaultView.location.hash = "access";
+  await ctx.flush(8, 40);
+  doc.getElementById("rec-start").click();
+  await ctx.flush(6, 30);
+  assert.match(doc.getElementById("rec-start").textContent, /Reprendre/, "the button becomes a way back in, never a dead switch");
+  assert.match(doc.getElementById("rec-banner-text").textContent, /reprendra tout seul/i, "the pause announces its own end");
+  assert.equal(doc.getElementById("rec-check").disabled, true, "while paused, nothing is scanned");
+  doc.getElementById("rec-start").click();
+  await ctx.flush(16, 40);
+  assert.equal(doc.getElementById("rec-check").disabled, false, "and it is back without anyone reconfiguring the post");
+  assert.equal(ctx.errors.length, 0, "the kiosk is clean: " + ctx.errors.join(" | "));
+  closeIt(ctx);
+});
+
+test("a refused camera on the office post retries itself until it is allowed", async () => {
+  const { jar } = await space("coworking");
+  const ctx = track(await openPage("/app#settings", jar, { faceState: { loads: 0, faces: [], box: { x: 0, y: 0, width: 300, height: 400 } } }));
+  await ctx.flush(14, 40);
+  const doc = ctx.document;
+  assert.ok(doc.getElementById("rec-video"), "even on the settings screen the live post keeps its node");
+  assert.ok(doc.getElementById("rec-video").closest(".dock-holder"), "it is parked out of sight, not unmounted");
+  const cam = ctx.window.navigator.mediaDevices;
+  const working = cam.getUserMedia;
+  doc.getElementById("rec-start").click();                      // pause
+  await ctx.flush(3, 20);
+  cam.getUserMedia = async () => { throw Object.assign(new Error("busy"), { name: "NotReadableError" }); };
+  doc.querySelector('[data-action="camera-test"]').click();      // reprise -> caméra tenue ailleurs
+  await ctx.flush(8, 40);
+  assert.match(doc.getElementById("rec-banner-text").textContent, /caméra/i, "the refusal is explained, on the video itself");
+  const card = doc.querySelector('.toasts [data-tag="camera"]');
+  assert.ok(card, "and as a notification card with a way out");
+  assert.match(card.textContent, /r\u00e9essaie seul/i, "the card says the post retries on its own");
+  assert.ok([...card.querySelectorAll("button")].some((b) => /Réessayer/.test(b.textContent)), "with a button to force the next try");
+  assert.equal(doc.querySelectorAll('.toasts [data-tag="camera"]').length, 1, "one card per subject, never a stack of the same complaint");
+  // le poste se libère : personne ne retouche la page, le direct revient
+  cam.getUserMedia = working;
+  [...card.querySelectorAll("button")].find((b) => /R\u00e9essayer/.test(b.textContent)).click();
+  await ctx.flush(20, 40);
+  assert.equal(doc.getElementById("rec-check").disabled, false, "the camera came back on its own");
+  assert.ok(doc.getElementById("rec-auto").checked, "auto mode came back with it");
+  assert.equal(doc.querySelectorAll('.toasts [data-tag="camera"]').length, 0, "and the complaint retires itself once the camera is back");
+  closeIt(ctx);
+});
+
+test("the space learns about another post's passages without a reload", async () => {
+  const { jar } = await space("office");
+  const name = "Nadia " + uniq();
+  const member = (await raw("/api/members", { jar, body: { name, subscription_end: today } })).data;
+  await raw(`/api/members/${member.id}/enroll`, { jar, body: { descriptor: descriptorFor(5), consent: true } });
+  const code = (await raw("/api/devices/pairing", { jar, body: { name: "Borne hall", kind: "kiosk" } })).data.code;
+  const kiosk = makeJar();
+  assert.equal((await raw("/api/pair", { jar: kiosk, body: { code } })).status, 200, "the post is paired");
+
+  const ctx = track(await openPage("/app#overview", jar, { faceState: { loads: 0, faces: [], box: { x: 0, y: 0, width: 300, height: 400 } } }));
+  await ctx.flush(12, 40);
+  const doc = ctx.document;
+  assert.equal(doc.querySelectorAll('[data-live="journal"] table tbody tr').length, 0, "the journal starts empty");
+
+  // la borne, elle, enregistre un passage : l'espace ne doit pas avoir à être rechargé
+  const entry = await raw("/api/device/recognized", { jar: kiosk, body: { member_id: member.id, distance: 0.21 } });
+  assert.equal(entry.status, 200, JSON.stringify(entry.data));
+  await ctx.flush(110, 70);                     // plus que le pas du direct (5 s)
+  const row = doc.querySelector('[data-live="journal"] table tbody tr');
+  assert.ok(row, "the line appeared by itself, no F5");
+  assert.match(row.textContent, /Nadia/);
+  assert.match(row.textContent, /Borne hall/, "and it tells which post saw it");
+  const card = doc.querySelector('.toasts [data-verdict="granted"]');
+  assert.ok(card, "with a card on the edge of the screen");
+  assert.match(card.textContent, /Borne hall/, "naming the post it came from");
+  assert.match(card.textContent, /pointage|accès/i, "and repeating the sentence the kiosk spoke");
+  const pointage = [...doc.querySelectorAll(".stat")].find((s) => /Pointages aujourd/.test(s.textContent));
+  assert.equal(pointage.querySelector(".stat-value").textContent, "1", "the KPI followed");
+  assert.ok(doc.querySelectorAll('[data-live="today"] .live-list li').length >= 1, "and the live strip of the space shows it too");
+  doc.defaultView.location.hash = "access";
+  await ctx.flush(8, 40);
+  assert.match(doc.getElementById("access-journal").textContent, /Nadia/, "the other screen reads the same live data, without a reload");
+  closeIt(ctx);
+});
+
+test("period, search, filters and pages are answered by the screen, not by a reload", async () => {
+  const { jar } = await space("canteen");
+  const companyToday = (await raw("/api/state", { jar })).data.today;
+  const expired = (await raw("/api/members", { jar, body: { name: "Hakim " + uniq(), subscription_end: "2020-01-01" } })).data;
+  assert.ok(expired.id, "an expired member exists");
+  for (let i = 0; i < 13; i++) {
+    assert.equal((await raw("/api/members", { jar, body: { name: `Inscrit ${i} ` + uniq(), subscription_end: companyToday } })).status, 200);
+  }
+  const ctx = track(await openPage("/app#members", jar));
+  await ctx.flush(12, 40);
+  const doc = ctx.document;
+  assert.equal(doc.querySelectorAll("table tbody tr").length, PER_PAGE_TEST, "the list is paginated, never endless");
+  assert.match(doc.querySelector(".pager").textContent, /1 \/ 2/);
+  doc.querySelector('[data-action="pager"][data-page="2"]').click();
+  await ctx.flush(4, 30);
+  assert.match(doc.querySelector(".pager").textContent, /2 \/ 2/, "the next page is the last one");
+  doc.querySelector('[data-action="pager"][data-page="1"]').click();
+  await ctx.flush(4, 30);
+
+  const box = doc.querySelector('[data-action="search"][data-target="members"]');
+  box.value = "Hakim";
+  box.dispatchEvent(new ctx.window.Event("input", { bubbles: true }));
+  await ctx.flush(6, 40);
+  assert.equal(doc.querySelectorAll("table tbody tr").length, 1, "the search kept a single row");
+  assert.ok(doc.querySelector("mark"), "and shows why it kept that one");
+  box.value = "";
+  box.dispatchEvent(new ctx.window.Event("input", { bubbles: true }));
+  await ctx.flush(6, 40);
+  doc.querySelector('.filters [data-value="expired"]').click();
+  await ctx.flush(4, 30);
+  assert.equal(doc.querySelectorAll("table tbody tr").length, 1, "the filter answers on the spot");
+  assert.match(doc.querySelector("table tbody tr").textContent, /Expir/);
+  doc.querySelector('.filters [data-value="all"]').click();
+  await ctx.flush(4, 30);
+
+  doc.defaultView.location.hash = "overview";
+  await ctx.flush(8, 40);
+  assert.equal(doc.querySelectorAll(".chart .bar").length, 7, "seven days by default");
+  doc.querySelector('[data-action="period"][data-days="30"]').click();
+  await ctx.flush(10, 40);
+  assert.equal(doc.querySelectorAll(".chart .bar").length, 30, "the period tab redraws the chart");
+  assert.equal(doc.querySelector('[data-action="period"][data-days="30"]').getAttribute("aria-pressed"), "true", "and the tab stays pressed");
+  assert.ok(doc.querySelector('.steps-board .step-item'), "the board says what to do next");
+  const journalRow = doc.querySelectorAll("#page table tbody tr").length;
+  assert.ok(journalRow >= 0);
+  assert.equal(ctx.errors.length, 0, "the screens are clean: " + ctx.errors.join(" | "));
+  closeIt(ctx);
+});
+
+test("the notification stack is bounded, closable and muteable from the bar", async () => {
+  const { jar } = await space("fitness");
+  const ctx = track(await openPage("/app#access", jar));
+  await ctx.flush(12, 40);
+  const doc = ctx.document;
+  for (let i = 0; i < 7; i++) {
+    doc.querySelector('[data-action="journal-help"]').click();
+    await ctx.flush(2, 10);
+  }
+  const cards = doc.querySelectorAll(".toasts .toast:not(.toast-out)");
+  assert.ok(cards.length > 0 && cards.length <= 4, "the stack holds at most four cards, here " + cards.length);
+  assert.ok(doc.querySelector(".toasts[role='region']"), "the stack is an announced region");
+  cards[0].querySelector(".toast-close").click();
+  await ctx.flush(4, 30);
+  await ctx.flush(10, 30);
+  assert.equal(doc.querySelectorAll(".toasts .toast:not(.toast-out)").length, cards.length - 1, "a card closes for good");
+  const sound = doc.getElementById("bar-sound");
+  const before = sound.getAttribute("aria-pressed");
+  sound.click();
+  await ctx.flush(2, 10);
+  assert.notEqual(sound.getAttribute("aria-pressed"), before, "the bar toggles the sound");
+  assert.equal(ctx.window.localStorage.getItem("faceid.sound") === "off", before === "true", "and the choice survives on this post");
+  sound.click();
+  closeIt(ctx);
+  assert.equal(ctx.errors.length, 0, "the stack is clean: " + ctx.errors.join(" | "));
 });
 
 test("every screen of the app stays free of inline styles and console errors", async () => {
   const { jar } = await space("canteen");
   for (const path of ["/", "/login", "/signup", "/app"]) {
-    const ctx = await openPage(path, jar);
+    const ctx = track(await openPage(path, jar));
     for (const page of ["overview", "members", "access", "settings"]) {
       ctx.window.location.hash = page;
       await ctx.flush(6, 30);
     }
     assert.deepEqual(ctx.inlineStyles, [], `${path} × every page injects no inline style attribute`);
     assert.equal(ctx.errors.length, 0, `${path} is clean: ` + ctx.errors.join(" | "));
+    closeIt(ctx);
   }
   const staticHtml = ["index", "login", "signup", "app"].map((n) => readFileSync(join(SITE, `${n}.html`), "utf8")).join("\n");
   assert.equal(/\sstyle=/.test(staticHtml), false, "the static HTML carries no style attribute either");

@@ -6,6 +6,10 @@
   const PAGES = ["overview", "members", "access", "devices", "settings"];
   const DEVICE_KINDS = [["kiosk", "Kiosque d'entrée"], ["phone", "Téléphone"], ["tablet", "Tablette"], ["desk", "Poste d'accueil"], ["box", "Boîtier / caméra"]];
   const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  // Une boucle qui « reprend dans 10 s » ne doit pas survivre à la fermeture de l'onglet :
+  // chaque maillon de chaîne vérifie d'abord que la fenêtre est encore ouverte (c'est aussi ce
+  // qui garde les tests courts — une page fermée qui reprogramme un minuteur ne meurt jamais).
+  const alive = () => !window.closed;
   const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
 
   let S = null; // server state (/api/state)
@@ -15,6 +19,22 @@
   let page = PAGES.includes(location.hash.slice(1)) ? location.hash.slice(1) : "overview";
   let sector = "fitness";
   let pendingCapture = null; // member id to enroll right after creation
+  let shell = "";            // signature de l'ossature : ce qui impose de reconstruire la page
+
+  // ---- Ce que l'écran regarde : période, recherche, filtre, tri, page ----------
+  // Un SaaS ne demande jamais un « rafraîchir » : il se souvient de ce qu'on regardait.
+  const store = {
+    get(key, fallback) { try { const v = localStorage.getItem(key); return v === null || v === "" ? fallback : v; } catch (_) { return fallback; } },
+    set(key, value) { try { localStorage.setItem(key, String(value)); } catch (_) { /* navigation privée, quotas : rien de grave */ } },
+  };
+  const PERIODS = [[1, "Aujourd'hui"], [7, "7 jours"], [30, "30 jours"], [90, "Trimestre"]];
+  const PER_PAGE = 12;
+  const NOTIFY_KEY = "faceid.browser";
+  let days = Math.min(90, Math.max(1, Number(store.get("faceid.days", 7)) || 7));
+  let head = 0;              // pointeur du direct : le dernier passage déjà annoncé, jamais deux fois
+  let cameraBooted = false;  // une seule tentative d'ouverture par chargement de page
+  let pollTimer = null;
+  const view = { overview: { q: "", state: "all" }, access: { q: "", state: "all" }, members: { q: "", state: "all", sort: "recent", page: 1 } };
 
   // ---- API -----------------------------------------------------------------
   async function api(path, body, method) {
@@ -34,14 +54,48 @@
     }
   }
 
+  // Le bandeau reste dans le DOM comme région aria (les lecteurs d'écran, et les tests, s'en
+  // servent) ; à l'œil, la notification est désormais une fiche empilée en haut à droite :
+  // icône métier, durée de vie, action, son — et une voix sur le kiosque.
   const flashEl = document.getElementById("flash");
   let flashTimer = null;
-  function flash(message, kind) {
-    flashEl.textContent = message;
-    flashEl.className = "flash flash-" + (kind || "success");
-    flashEl.hidden = false;
-    clearTimeout(flashTimer);
-    flashTimer = setTimeout(() => { flashEl.hidden = true; }, 6000);
+  function flash(message, kind, detail) {
+    const tone = kind === "error" ? "error" : kind === "warn" ? "warn" : "success";
+    if (flashEl) {
+      flashEl.textContent = message + (detail ? " " + detail : "");
+      flashEl.className = "flash sr-only flash-" + tone;
+      flashEl.hidden = false;
+      clearTimeout(flashTimer);
+      flashTimer = setTimeout(() => { flashEl.hidden = true; }, 6000);
+    }
+    Toast.show({ kind: tone, title: message, body: detail, duration: tone === "error" ? 9000 : tone === "warn" ? 7000 : 4600, sound: tone !== "success" });
+  }
+
+  // La barre du haut, toujours visible, dit si la caméra de ce poste tourne : c'est la santé
+  // du produit, et elle ne doit pas demander d'aller chercher l'onglet « Contrôle d'accès ».
+  function syncBar(on, note) {
+    const pill = document.getElementById("bar-cam");
+    if (!pill) return;
+    const dot = pill.querySelector(".dot-live");
+    if (dot) dot.classList.toggle("on", Boolean(on));
+    const label = document.getElementById("bar-cam-text");
+    if (label) label.textContent = on ? "Caméra active" : (note || "Caméra en pause");
+    pill.title = on ? "La caméra de ce poste analyse les visages en continu. Cliquez pour voir le direct." : (note || "La caméra de ce poste est en pause — elle se relance seule.");
+  }
+  const barSound = document.getElementById("bar-sound");
+  if (barSound) {
+    const paintSound = () => { const m = Toast.muted(); barSound.textContent = m ? "🔕 Sons coupés" : "🔔 Sons"; barSound.setAttribute("aria-pressed", String(!m)); };
+    paintSound();
+    barSound.addEventListener("click", () => { Toast.muted(!Toast.muted()); paintSound(); if (!Toast.muted()) { Toast.unlock(); Toast.show({ kind: "info", title: "Sons de notification réactivés", body: "Chaque passage, chaque appareil relié et chaque incident se font entendre.", duration: 3000 }); } });
+  }
+  const barCam = document.getElementById("bar-cam");
+  if (barCam) barCam.addEventListener("click", () => { location.hash = "access"; });
+  // Un navigateur n'autorise un son qu'après un geste : on le capte une fois, sans le réclamer.
+  ["pointerdown", "keydown"].forEach((evt) => window.addEventListener(evt, () => Toast.unlock(), { once: true, passive: true }));
+
+  function notify(title, body) {
+    if (store.get(NOTIFY_KEY, "on") === "off" || typeof Notification === "undefined" || Notification.permission !== "granted") return;
+    try { new Notification(title, { body: body || "", tag: "faceid-" + title }); } catch (_) { /* refusé sans service worker : les fiches suffisent */ }
   }
 
   // ---- Voice announcements (free: browser French female voice, else recorded clips) ----
@@ -164,42 +218,168 @@
   // ---- Rendering -------------------------------------------------------------
   const sec = () => S.sector;
   const badge = (end) => (end >= S.today ? '<span class="badge badge-ok">Actif</span>' : '<span class="badge badge-warn">Expiré</span>');
-  function journal(rows) {
+  // Le surlignage du terme cherché : le texte échappé d'abord, l'index trouvé sur l'original.
+  function hl(text, needle) {
+    const t = String(text ?? "");
+    const n = String(needle || "").trim();
+    if (!n) return esc(t);
+    const i = t.toLowerCase().indexOf(n.toLowerCase());
+    if (i < 0) return esc(t);
+    return esc(t.slice(0, i)) + "<mark>" + esc(t.slice(i, i + n.length)) + "</mark>" + esc(t.slice(i + n.length));
+  }
+  const periodTabs = () => `<div class="tabs" role="group" aria-label="Période observée">` +
+    PERIODS.map(([d, label]) => `<button type="button" data-action="period" data-days="${d}" aria-pressed="${d === days ? "true" : "false"}">${label}</button>`).join("") + "</div>";
+  const chipSet = (name, current, items) => `<div class="filters" role="group" aria-label="Filtres">` +
+    items.map(([v, label]) => `<button type="button" class="chip" data-action="filter" data-target="${name}" data-value="${v}" aria-pressed="${v === current ? "true" : "false"}">${label}</button>`).join("") + "</div>";
+  const searchBox = (name, placeholder) => `<span class="search"><input type="search" data-action="search" data-target="${name}" placeholder="${esc(placeholder)}" aria-label="${esc(placeholder)}" autocomplete="off" value="${esc(view[name].q)}"></span>`;
+  const csvButton = `<button class="btn btn-ghost btn-sm" type="button" data-action="export-csv" title="Télécharger la période affichée en CSV (Excel, Numbers, Sheets)">⬇ Exporter</button>`;
+  const clock = () => new Date().toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+
+  // Une ligne de journal, la même partout : tableau complet ou fil du direct.
+  function passageRow(l, needle) {
     const s = sec();
-    if (!rows.length) return `<p class="muted">Aucun ${esc(s.entry.toLowerCase())} enregistré pour le moment.</p>`;
-    return `<table><thead><tr><th>${esc(cap(s.person))}</th><th>Méthode</th><th>Résultat</th><th>Heure</th><th>Date</th></tr></thead><tbody>` +
-      rows.map((l) => `<tr><td>${esc(l.name)}</td><td>${esc(l.method)}</td><td>${l.status === "granted" ? `<span class="badge badge-ok">${s.rule === "attendance" ? "Pointé" : "Autorisé"}</span>` : '<span class="badge badge-warn">Refusé</span>'}${l.late ? ' <span class="badge badge-late">Retard</span>' : ""}</td><td>${esc(l.local_time || "—")}</td><td class="muted">${esc(l.local_date)}</td></tr>`).join("") +
-      "</tbody></table>";
+    const ok = l.status === "granted";
+    return `<tr><td>${hl(l.name, needle)}</td><td class="muted">${esc(l.method)}</td><td>${ok ? `<span class="badge badge-ok">${s.rule === "attendance" ? "Pointé" : "Autorisé"}</span>` : '<span class="badge badge-warn">Refusé</span>'}${l.late ? ' <span class="badge badge-late">Retard</span>' : ""}</td><td>${esc(l.local_time || "—")}</td><td class="muted">${esc(l.local_date)}</td><td class="muted">${esc(l.device_name || "ce poste")}</td></tr>`;
+  }
+  function journalTable(rows, needle) {
+    const s = sec();
+    if (!rows.length) return `<p class="empty"><strong>Aucun ${esc(s.entry.toLowerCase())} sur cette période.</strong>Dès qu'un visage passe devant une caméra — ici ou sur un kiosque relié — la ligne apparaît sans rechargement.</p>`;
+    return `<table class="sticky"><thead><tr><th>${esc(cap(s.person))}</th><th>Méthode</th><th>Résultat</th><th>Heure</th><th>Date</th><th>Poste</th></tr></thead><tbody>` + rows.map((l) => passageRow(l, needle)).join("") + "</tbody></table>";
+  }
+  function scopedLogs(where) {
+    const v = view[where];
+    const needle = v.q.trim().toLowerCase();
+    let rows = S.logs.filter((l) => {
+      if (v.state === "granted" && l.status !== "granted") return false;
+      if (v.state === "refused" && l.status === "granted") return false;
+      if (v.state === "late" && !l.late) return false;
+      if (needle && !(String(l.name).toLowerCase().includes(needle) || String(l.device_name || "").toLowerCase().includes(needle))) return false;
+      return true;
+    });
+    return rows;
+  }
+  // Le même bloc journal partout : la page décide quelles colonnes et quel nombre de lignes.
+  const journalWhere = () => (page === "access" ? "access" : "overview");
+  // Le titre et la barre d'outils sont fixes (on n'efface jamais une saisie en cours) ; seule la
+  // zone data-live est repeinte par le direct, la recherche et les filtres.
+  function journalCard(id) {
+    return `<section class="card"><div class="card-head"><h2>Journal des ${esc(sec().entries.toLowerCase())}</h2><button class="btn btn-link btn-sm" type="button" data-action="journal-help">comment lire ce tableau&nbsp;?</button></div>${toolbar(journalWhere())}<div${id ? ` id="${id}"` : ""} data-live="journal">${journalPanel()}</div></section>`;
+  }
+  function journalPanel() {
+    const where = journalWhere();
+    const v = view[where];
+    const rows = scopedLogs(where);
+    const shown = where === "overview" ? rows.slice(0, 8) : rows;
+    return `<p class="muted small">${rows.length} ligne(s) affichée(s) sur ${S.logs.length} lues${days === 1 ? "" : " · " + days + " jours"}${v.q ? " · recherche : « " + esc(v.q.trim()) + " »" : ""}</p>` + journalTable(shown, v.q.trim());
+  }
+  function toolbar(where) {
+    const v = view[where];
+    return `<div class="toolbar">${searchBox(where, where === "members" ? "Rechercher un nom ou un email…" : "Rechercher un nom, un poste…")}${chipSet(where === "members" ? "members" : "access", v.state, where === "members"
+      ? [["all", "Tous"], ["active", "Actifs"], ["expired", "Expirés"], ["enrolled", "Visage pris"], ["missing", "Sans visage"]]
+      : [["all", "Tous"], ["granted", "Autorisés"], ["refused", "Refusés"], ["late", "Retards"]])}${where === "access" ? csvButton : ""}</div>`;
+  }
+
+  function kpisHtml() {
+    return S.kpis.map(([label, value, tone]) => `<div class="stat"><span class="stat-label">${esc(label)}</span><span class="stat-value ${tone}">${esc(value)}</span></div>`).join("");
+  }
+  function chartHtml() {
+    const max = Math.max(1, ...S.chart.map((c) => c.count));
+    const p = S.period || {};
+    let html = `<h2>${esc(sec().entries)} — ${esc(days === 1 ? "aujourd'hui" : days + " jours")}</h2><div class="chart">` +
+      S.chart.map((c) => `<div class="bar-wrap"><div class="bar" data-height="${Math.round((c.count / max) * 100)}"><span>${c.count}</span></div><small>${esc(c.day)}</small></div>`).join("") + "</div>";
+    if (p.granted !== undefined) {
+      html += `<p class="muted small">${p.granted} autorisé(s) · ${p.refused} refus(s) · ${p.people} personne(s) distinctes${p.late ? " · " + p.late + " retard(s)" : ""} · ${esc(p.from)} → ${esc(p.to)}</p>`;
+    }
+    return html;
+  }
+  // Le tableau de bord doit dire quoi faire ensuite, pas seulement ce qui s'est passé.
+  function stepsHtml() {
+    const s = sec();
+    const enrolled = S.members.filter((m) => m.enrolled).length;
+    const devices = (S.devices && S.devices.count) || 0;
+    const online = (S.devices && S.devices.online) || 0;
+    const steps = [
+      { t: cap(s.people), note: S.members.length ? S.members.length + "-enregistré(s) dans l'espace." : "Ajoutez la première personne : nom, date d'accès, visage.", href: "members", cta: "Ajouter", done: S.members.length > 0 },
+      { t: "Visages", note: enrolled ? enrolled + " empreinte(s) enregistrée(s), effaçables à tout moment." : "Aucun visage capturé : sans empreinte, la reconnaissance refuse tout le monde.", href: "members", cta: "Capturer", done: enrolled > 0 },
+      { t: "Postes reliés", note: devices ? devices + " appareil(s) dont " + online + " en ligne." : "Un téléphone, une tablette ou une borne peuvent reconnaître à l'entrée avec un code.", href: "devices", cta: "Générer un code", done: devices > 0 },
+      { t: "Caméra de ce poste", note: dock.running() ? "Active : ce navigateur analyse les visages en continu." : "En pause d'une minute ; elle se relance seule, sans clic.", href: "access", cta: "Ouvrir le direct", done: dock.running() },
+    ];
+    return `<div class="card-head"><h2>Mise en route</h2><span class="muted small">Ce qui reste à faire, dans l'ordre</span></div><div class="steps-board">` +
+      steps.map((st, i) => `<div class="step-item ${st.done ? "done" : ""}"><span class="mark">${st.done ? "✓" : i + 1}</span><div><strong>${esc(st.t)}</strong><span class="muted">${esc(st.note)}</span></div>${st.done ? "" : `<button class="btn btn-link btn-sm" type="button" data-action="goto" data-goto="${st.href}">${esc(st.cta)} →</button>`}</div>`).join("") + "</div>";
+  }
+  function attendanceHtml() {
+    const s = sec();
+    let html = `<h2>Présences du jour <span class="muted small">— début ${esc(S.org.work_start)}, tolérance ${esc(S.org.late_tolerance)} min</span></h2>`;
+    html += S.attendance.length
+      ? `<table><thead><tr><th>Employé</th><th>Arrivée</th><th>Statut</th></tr></thead><tbody>${S.attendance.map((a) => `<tr><td>${esc(a.name)}</td><td>${esc(a.arrival || "—")}</td><td>${a.arrival ? '<span class="badge badge-ok">Présent</span>' + (a.late ? ' <span class="badge badge-late">En retard</span>' : "") : '<span class="badge badge-warn">Absent</span>'}</td></tr>`).join("")}</tbody></table>`
+      : `<p class="muted">Ajoutez vos ${esc(s.people)} pour suivre les présences.</p>`;
+    return html;
+  }
+  // Le fil du direct : la partie se joue ici, pas après un F5.
+  function liveStripHtml() {
+    const rows = S.logs.slice(0, 6);
+    let html = `<div class="card-head"><h2>En direct <span class="badge badge-live">live</span></h2><span class="muted small">passage suivant = fiche sonore dans la seconde</span></div>`;
+    if (!rows.length) return html + `<p class="muted">Rien pour l'instant. Placez-vous devant la caméra de ce poste, ou reliez une borne à l'entrée.</p>`;
+    return html + `<ul class="live-list">` + rows.map((l) => `<li class="live-${l.status === "granted" ? "granted" : "expired"}">${esc(l.local_time || clock())} — <b>${esc(l.name)}</b> — ${l.status === "granted" ? esc(sec().rule === "attendance" ? "pointé(e)" : "autorisé(e)") : "refusé(e)"} · ${esc(l.device_name || "ce poste")}</li>`).join("") + "</ul>";
   }
 
   function renderOverview() {
     const s = sec();
-    const max = Math.max(1, ...S.chart.map((c) => c.count));
     const next = s.rule === "attendance"
       ? { href: "#access", label: "Voir les présences du jour" }
       : { href: "#members", label: "Ajouter un·e " + s.person };
-    let html = `<div class="page-head"><h1>Tableau de bord</h1><span class="muted small">${esc(s.label)} · journée du ${esc(S.today)}</span><a class="btn btn-ghost btn-sm" href="${next.href}">${esc(next.label)}</a></div><div class="stats">` +
-      S.kpis.map(([label, value, tone]) => `<div class="stat"><span class="stat-label">${esc(label)}</span><span class="stat-value ${tone}">${esc(value)}</span></div>`).join("") + "</div>";
-    if (s.rule === "attendance") {
-      html += `<section class="card"><h2>Présences du jour <span class="muted small">— début ${esc(S.org.work_start)}, tolérance ${esc(S.org.late_tolerance)} min</span></h2>`;
-      html += S.attendance.length
-        ? `<table><thead><tr><th>Employé</th><th>Arrivée</th><th>Statut</th></tr></thead><tbody>${S.attendance.map((a) => `<tr><td>${esc(a.name)}</td><td>${esc(a.arrival || "—")}</td><td>${a.arrival ? '<span class="badge badge-ok">Présent</span>' + (a.late ? ' <span class="badge badge-late">En retard</span>' : "") : '<span class="badge badge-warn">Absent</span>'}</td></tr>`).join("")}</tbody></table>`
-        : '<p class="muted">Ajoutez vos employés pour suivre les présences.</p>';
-      html += "</section>";
+    let html = `<div class="page-head"><h1>Tableau de bord</h1><span class="muted small">${esc(s.label)} · journée du ${esc(S.today)} · ${esc(S.org.timezone)} · ${S.devices ? S.devices.online + " poste(s) en ligne" : "aucun poste relié"}</span>${periodTabs()}<a class="btn btn-ghost btn-sm" href="${next.href}">${esc(next.label)}</a></div>`;
+    html += `<section class="card" data-live="steps">${stepsHtml()}</section>`;
+    html += `<div class="stats" data-live="kpis">${kpisHtml()}</div>`;
+    html += `<div id="dock-slot"></div>`;
+    html += `<div class="two-cols"><section class="card" data-live="chart">${chartHtml()}</section>`;
+    html += `<section class="card" data-live="today">${liveStripHtml()}</section></div>`;
+    if (s.rule === "attendance") html += `<section class="card" data-live="attendance">${attendanceHtml()}</section>`;
+    html += journalCard();
+    return html;
+  }
+
+  function memberRows() {
+    const v = view.members;
+    const needle = v.q.trim().toLowerCase();
+    let rows = S.members.filter((m) => {
+      const active = m.subscription_end >= S.today;
+      if (v.state === "active" && !active) return false;
+      if (v.state === "expired" && active) return false;
+      if (v.state === "enrolled" && !m.enrolled) return false;
+      if (v.state === "missing" && m.enrolled) return false;
+      if (needle && !(String(m.name).toLowerCase().includes(needle) || String(m.email || "").toLowerCase().includes(needle))) return false;
+      return true;
+    });
+    const key = (m) => (v.sort === "name" ? String(m.name).toLowerCase() : v.sort === "expiry" ? m.subscription_end : String(m.last_today || m.subscription_end));
+    rows = rows.slice().sort((a, b) => (v.sort === "name" || v.sort === "expiry") ? String(key(a)).localeCompare(String(key(b))) : String(key(b)).localeCompare(String(key(a))));
+    const pages = Math.max(1, Math.ceil(rows.length / PER_PAGE));
+    if (v.page > pages) v.page = pages;
+    const slice = rows.slice((v.page - 1) * PER_PAGE, v.page * PER_PAGE);
+    const s = sec();
+    let html = "";
+    if (!rows.length) {
+      html += `<p class="empty"><strong>${S.members.length ? "Aucun résultat avec ce filtre." : "Aucun " + esc(s.person) + "."}</strong>${S.members.length ? "Changez de filtre ou videz la recherche." : "Ajoutez le premier ci-dessus : nom, date d'accès, un coup d'œil à la caméra."}</p>`;
+    } else {
+      html += `<table><thead><tr><th>Nom</th><th>Email</th><th>${esc(s.access)} jusqu'au</th><th>Statut</th><th>Dernier passage aujourd'hui</th><th>Visage</th><th>Actions</th></tr></thead><tbody>` +
+        slice.map((m) => `<tr>
+          <td>${hl(m.name, v.q)}</td><td class="muted">${m.email ? hl(m.email, v.q) : "—"}</td><td>${esc(m.subscription_end)}</td><td>${badge(m.subscription_end)}</td>
+          <td>${m.last_today ? '<span class="badge badge-ok">' + esc(m.last_today) + "</span>" : '<span class="muted">—</span>'}</td>
+          <td>${m.enrolled ? `<span class="badge badge-info">Enregistré</span> <button class="btn btn-link btn-sm" type="button" data-action="revoke" data-id="${m.id}">Effacer</button>` : `<button class="btn btn-ghost btn-sm" type="button" data-action="enroll" data-id="${m.id}" data-name="${esc(m.name)}">📷 Capturer</button>`}</td>
+          <td class="actions">
+            <form class="inline" data-api="/api/members/${m.id}/renew"><input type="date" name="subscription_end" required value="${esc(m.subscription_end)}"><button class="btn btn-ghost btn-sm" type="submit">Renouveler</button></form>
+            <button class="btn btn-danger btn-sm" type="button" data-action="delete" data-id="${m.id}" data-name="${esc(m.name)}">Supprimer</button>
+          </td></tr>`).join("") + "</tbody></table>";
+      html += `<div class="pager"><button class="btn btn-ghost btn-sm" type="button" data-action="pager" data-target="members" data-page="${v.page - 1}" ${v.page === 1 ? "disabled" : ""}>←</button><span>${v.page} / ${pages} · ${rows.length} ${esc(s.people)}</span><button class="btn btn-ghost btn-sm" type="button" data-action="pager" data-target="members" data-page="${v.page + 1}" ${v.page === pages ? "disabled" : ""}>→</button></div>`;
     }
-    // The bar height travels as data-height: the page is served with `style-src 'self'`
-    // (no 'unsafe-inline'), so a style="…" attribute written into the markup is refused by
-    // the browser and every bar collapses to its min-height. Heights are applied from JS below.
-    html += `<section class="card"><h2>${esc(s.entries)} sur 7 jours</h2><div class="chart">` +
-      S.chart.map((c) => `<div class="bar-wrap"><div class="bar" data-height="${Math.round((c.count / max) * 100)}"><span>${c.count}</span></div><small>${esc(c.day)}</small></div>`).join("") + "</div></section>";
-    html += `<section class="card"><h2>Derniers ${esc(s.entries.toLowerCase())}</h2>${journal(S.logs.slice(0, 10))}</section>`;
     return html;
   }
 
   function renderMembers() {
     const s = sec();
     const active = S.members.filter((m) => m.subscription_end >= S.today).length;
-    let html = `<div class="page-head"><h1>${esc(cap(s.people))}</h1><span class="muted small">${S.members.length} ${esc(s.people)}, ${active} avec ${esc(s.access).toLowerCase()} actif(ve)</span></div>
+    const enrolled = S.members.filter((m) => m.enrolled).length;
+    let html = `<div class="page-head"><h1>${esc(cap(s.people))}</h1><span class="muted small">${S.members.length} ${esc(s.people)}, ${active} avec ${esc(s.access).toLowerCase()} actif(ve), ${enrolled} visage(s) enregistré(s)</span>${csvButton}</div>
       <section class="card"><h2>Ajouter un ${esc(s.person)}</h2>
         <p class="muted small">Tapez le nom, cliquez sur « Ajouter et capturer » : la personne regarde la caméra une seconde, c'est enregistré.</p>
         <form class="inline-form" data-api="/api/members" id="add-member-form">
@@ -218,49 +398,34 @@
           <button class="btn btn-ghost" type="submit">Ajouter sans visage</button>
         </form>
       </section>
-      <section class="card"><h2>Liste (${S.members.length})</h2>`;
-    if (!S.members.length) html += `<p class="muted">Aucun ${esc(s.person)}. Ajoutez le premier ci-dessus.</p>`;
-    else {
-      html += `<table><thead><tr><th>Nom</th><th>Email</th><th>${esc(s.access)} jusqu'au</th><th>Statut</th><th>Visage</th><th>Actions</th></tr></thead><tbody>` +
-        S.members.map((m) => `<tr>
-          <td>${esc(m.name)}</td><td class="muted">${esc(m.email || "—")}</td><td>${esc(m.subscription_end)}</td><td>${badge(m.subscription_end)}</td>
-          <td>${m.enrolled ? `<span class="badge badge-info">Enregistré</span> <button class="btn btn-link btn-sm" type="button" data-action="revoke" data-id="${m.id}">Effacer</button>` : `<button class="btn btn-ghost btn-sm" type="button" data-action="enroll" data-id="${m.id}" data-name="${esc(m.name)}">📷 Capturer</button>`}</td>
-          <td class="actions">
-            <form class="inline" data-api="/api/members/${m.id}/renew"><input type="date" name="subscription_end" required value="${esc(m.subscription_end)}"><button class="btn btn-ghost btn-sm" type="submit">Renouveler</button></form>
-            <button class="btn btn-danger btn-sm" type="button" data-action="delete" data-id="${m.id}" data-name="${esc(m.name)}">Supprimer</button>
-          </td></tr>`).join("") + "</tbody></table>";
-    }
-    return html + "</section>";
+      <section class="card"><div class="card-head"><h2>Liste (${S.members.length})</h2><label class="muted small">Tri
+        <select data-action="sort" aria-label="Trier la liste">
+          <option value="recent" ${view.members.sort === "recent" ? "selected" : ""}>Passages récents d'abord</option>
+          <option value="name" ${view.members.sort === "name" ? "selected" : ""}>Nom A→Z</option>
+          <option value="expiry" ${view.members.sort === "expiry" ? "selected" : ""}>Fin d'accès</option>
+        </select></label></div>
+        <div class="toolbar">${searchBox("members", "Rechercher un nom ou un email…")}${chipSet("members", view.members.state, [["all", "Tous"], ["active", "Actifs"], ["expired", "Expirés"], ["enrolled", "Visage pris"], ["missing", "Sans visage"]])}</div>
+        <div data-live="members">${memberRows()}</div>
+      </section>`;
+    return html;
   }
 
   function manualList() {
     const s = sec();
     if (!S.members.length) return `<p class="muted">Ajoutez d'abord des ${esc(s.people)}.</p>`;
-    return `<ul class="member-list">${S.members.map((m) => `<li><span>${esc(m.name)} ${badge(m.subscription_end)}</span><button class="btn btn-ghost btn-sm" type="button" data-action="entry" data-id="${m.id}" ${m.subscription_end < S.today ? "disabled" : ""}>Valider</button></li>`).join("")}</ul>`;
+    return `<ul class="member-list">${S.members.map((m) => `<li><span>${esc(m.name)} ${badge(m.subscription_end)}${m.last_today ? ` <span class="muted small">vu(e) à ${esc(m.last_today)}</span>` : ""}</span><button class="btn btn-ghost btn-sm" type="button" data-action="entry" data-id="${m.id}" ${m.subscription_end < S.today ? "disabled" : ""}>Valider</button></li>`).join("")}</ul>`;
   }
 
   function renderAccess() {
     const s = sec();
     const rule = s.rule === "attendance" ? "le pointage est horodaté et les retards calculés" : s.rule === "one_per_day" ? "un seul repas par personne et par jour" : "l'accès est contrôlé selon la date payée";
-    return `<div class="page-head"><h1>${s.rule === "attendance" ? "Pointage" : "Contrôle d'accès"}</h1><span class="muted small">Ce poste-ci sert de kiosque ; un téléphone ou une caméra peuvent en faire un autre.</span><a class="btn btn-ghost btn-sm" href="#devices">Relier un appareil</a></div>
+    return `<div class="page-head"><h1>${s.rule === "attendance" ? "Pointage" : "Contrôle d'accès"}</h1><span class="muted small">La caméra de ce poste tourne en permanence : ${esc(rule)}. ${S.devices ? S.devices.online + " poste(s) en ligne" : ""}.</span>${periodTabs()}<a class="btn btn-ghost btn-sm" href="#devices">Relier un appareil</a></div>
+      <div id="dock-slot"></div>
       <div class="two-cols">
-        <section class="card kiosk"><h2>Reconnaissance faciale</h2>
-          <p class="muted small">Activez la caméra puis le mode automatique : chaque visage est analysé dans ce navigateur (aucune image envoyée), ${rule}. Aucune porte n'est actionnée depuis le navigateur (boîtier sur site à venir).</p>
-          <div class="video-wrap"><video id="rec-video" autoplay playsinline muted></video>
-            <div id="rec-banner" class="banner banner-idle" aria-live="assertive"><strong id="rec-banner-title">Caméra inactive</strong><span id="rec-banner-text">Cliquez sur « Activer la caméra ».</span></div></div>
-          <p id="rec-status" class="status" aria-live="polite"></p>
-          <div class="kiosk-controls">
-            <button class="btn btn-ghost" type="button" id="rec-start">Activer la caméra</button>
-            <button class="btn btn-primary" type="button" id="rec-check" disabled>Vérifier maintenant</button>
-            <label class="switch"><input type="checkbox" id="rec-auto" disabled> Mode automatique (kiosque)</label>
-            <button class="btn btn-ghost btn-sm js-voice-toggle" type="button" aria-pressed="true" title="Annonces vocales">🔊 Voix</button>
-          </div>
-          <small class="muted js-voice-info"></small>
-          <ul id="rec-live" class="live-list" aria-label="Derniers résultats"></ul>
-        </section>
-        <section class="card"><h2>${esc(s.manual)}</h2><p class="muted small">Sans caméra : sélectionnez la personne et validez.</p><div id="manual-list">${manualList()}</div></section>
+        <section class="card"><h2>${esc(s.manual)}</h2><p class="muted small">Sans caméra : sélectionnez la personne et validez.</p><div data-live="manual">${manualList()}</div></section>
+        <section class="card" data-live="today">${liveStripHtml()}</section>
       </div>
-      <section class="card"><h2>Journal des ${esc(s.entries.toLowerCase())}</h2><div id="access-journal">${journal(S.logs)}</div></section>`;
+      ${journalCard("access-journal")}`;
   }
 
   async function loadDevices() {
@@ -403,19 +568,23 @@ FACEID_TOKEN=… curl -s -X POST ${esc(origin)}/api/device/recognized \\
       if (!left) { spent = true; if (cell.id === "pair-countdown") pendingPair = null; }
     }
     if (spent) { loadDevices(); return; } // an expired code is not worth leaving on the board
+    if (!alive()) return;
     countdownTimer = setTimeout(paintCountdowns, 1000);
   }
 
   function renderSettings() {
     const s = sec();
+    const sound = Toast.muted() ? "coupés" : "activés";
+    const browser = typeof Notification === "undefined" ? "indisponible" : Notification.permission;
     return `<div class="page-head"><h1>Paramètres de l'espace</h1><span class="muted small">${esc(s.label)}</span></div>
       <section class="card"><h2>Entreprise</h2>
         <form class="stack" data-api="/api/settings">
           <label>Nom de l'entreprise<input name="company" required maxlength="100" value="${esc(S.org.name)}"></label>
           <label>Secteur (adapte le vocabulaire, les indicateurs et les règles d'accès)
-            <select name="sector">${Object.entries(S.sectors).map(([k, v]) => `<option value="${k}" ${k === S.org.sector ? "selected" : ""}>${esc(v.label)} — ${esc(v.pitch)}</option>`).join("")}</select></label>
+            <div class="sector-cards">${Object.entries(S.sectors).map(([k, v]) => `<label><input type="radio" name="sector" value="${k}" ${k === S.org.sector ? "checked" : ""}><span>${esc(v.label)}</span><small>${esc(v.pitch)}</small></label>`).join("")}</div></label>
           <label>Fuseau horaire (horodatage des ${esc(s.entries.toLowerCase())})
-            <select name="timezone">${S.timezones.map((tz) => `<option value="${tz}" ${tz === S.org.timezone ? "selected" : ""}>${tz}</option>`).join("")}</select></label>
+            <select name="timezone">${S.timezones.map((tz) => `<option value="${tz}" ${tz === S.org.timezone ? "selected" : ""}>${tz}</option>`).join("")}</select>
+            <span class="tz-clock">sur place il est <b id="tz-now" data-tz="${esc(S.org.timezone)}">…</b> <span class="muted small" id="tz-note"></span></span></label>
           <fieldset class="fieldset"><legend>Pointage (secteur PME & bureaux)</legend>
             <div class="inline-form">
               <label>Début de journée<input type="time" name="work_start" value="${esc(S.org.work_start)}" required></label>
@@ -426,6 +595,20 @@ FACEID_TOKEN=… curl -s -X POST ${esc(origin)}/api/device/recognized \\
           <button class="btn btn-primary" type="submit">Enregistrer</button>
         </form>
       </section>
+      <section class="card"><h2>Notifications</h2>
+        <p class="muted small">Ce que l'espace fait entendre et montrer quand quelque chose se passe : passage, appareil relié, caméra ou réseau en défaut.</p>
+        <ul class="checklist">
+          <li>Fiches empilées en haut à droite, avec le visage, l'heure, le poste et l'action utile.</li>
+          <li>Sons d'interface : ${esc(sound)} — le bouton 🔔 de la barre du haut bascule le son d'un clic.</li>
+          <li>Notifications système du navigateur : <b id="notify-state">${esc(browser)}</b>${browser === "default" ? ' — <button class="btn btn-link btn-sm" type="button" data-action="notify-ask">les activer</button>' : ""}</li>
+          <li>Annonces vocales du kiosque (une voix féminine française, gratuite, hors ligne) : <button class="btn btn-link btn-sm js-voice-toggle" type="button" aria-pressed="true">🔊 Voix</button></li>
+          <li>Le mode automatique du poste est <b>toujours activé</b> : une pause demandée à la main se lève au bout d'une minute.</li>
+        </ul>
+        <div class="kiosk-controls">
+          <button class="btn btn-ghost btn-sm" type="button" data-action="notify-test">Tester une notification</button>
+          <button class="btn btn-ghost btn-sm" type="button" data-action="camera-test">Tester la caméra de ce poste</button>
+        </div>
+      </section>
       <section class="card"><h2>Règles actives pour « ${esc(s.label)} »</h2>
         <ul class="checklist">
           <li>Vocabulaire : ${esc(s.people)}, ${esc(s.access.toLowerCase())}, ${esc(s.entries.toLowerCase())}.</li>
@@ -434,6 +617,13 @@ FACEID_TOKEN=… curl -s -X POST ${esc(origin)}/api/device/recognized \\
           <li>${esc(s.access)} expiré(e) = refus journalisé. Même personne reconnue deux fois en moins d'une minute = un seul enregistrement.</li>
           <li>Chaque entreprise ne voit que ses propres données ; les empreintes faciales sont calculées dans le navigateur, enregistrées avec accord et effaçables.</li>
         </ul>
+      </section>
+      <section class="card danger-zone"><h2>Zone sensible</h2>
+        <p class="muted small">Les postes reliés (téléphones, tablettes, bornes, boîtiers) reconnaissent les visages avec leur propre jeton. Ici, on les débranche tous d'un coup — le kiosque de ce poste continue de fonctionner.</p>
+        <div class="kiosk-controls">
+          <button class="btn btn-danger btn-sm" type="button" data-action="revoke-all">Révoquer les ${S.devices ? S.devices.count : 0} appareil(s) relié(s)</button>
+          <button class="btn btn-ghost btn-sm" type="button" data-action="export-csv">Exporter le journal (CSV)</button>
+        </div>
       </section>`;
   }
 
@@ -453,8 +643,35 @@ FACEID_TOKEN=… curl -s -X POST ${esc(origin)}/api/device/recognized \\
   }
 
   const pageEl = document.getElementById("page");
+
+  // Ce que l'écran regarde, et rien d'autre : le direct ne doit jamais effacer un formulaire
+  // en cours de saisie. Chaque zone vivante est peinte séparément ; une zone absente (autre
+  // écran, autre secteur) déclenche le rendu complet.
+  const LIVE = {
+    steps: () => stepsHtml(), kpis: () => kpisHtml(), chart: () => chartHtml(), today: () => liveStripHtml(),
+    journal: () => journalPanel(), members: () => memberRows(), manual: () => manualList(), attendance: () => attendanceHtml(),
+  };
+  const LIVES = { overview: ["steps", "kpis", "chart", "today", "journal"], members: ["members"], access: ["manual", "journal", "today"], settings: [], devices: [] };
+
+  function paintLive(name) {
+    const slot = pageEl.querySelector('[data-live="' + name + '"]');
+    if (!slot) return false;
+    if (document.activeElement && slot.contains(document.activeElement)) return true;   // on ne touche pas à ce que la personne est en train d'écrire
+    slot.innerHTML = LIVE[name]();
+    applyBarHeights(slot);
+    return true;
+  }
+  function paint() {
+    if (!S) return;
+    const names = LIVES[page] || [];
+    if (names.some((n) => !pageEl.querySelector('[data-live="' + n + '"]'))) { render(); return; }
+    names.forEach(paintLive);
+    dock.place(pageEl.querySelector("#dock-slot"), page === "access");
+  }
+
   function render() {
     if (page !== "devices") { clearTimeout(countdownTimer); countdownTimer = null; clearTimeout(liveTimer); }
+    const before = page + "|" + S.org.name + "|" + S.org.sector + "|" + S.today;
     sector = S.org.sector;
     document.body.className = "app sector-" + sector;
     document.title = S.org.name + " — FaceID Platform";
@@ -465,6 +682,7 @@ FACEID_TOKEN=… curl -s -X POST ${esc(origin)}/api/device/recognized \\
     document.querySelectorAll("#menu a").forEach((a) => { a.textContent = labels[a.dataset.page]; a.classList.toggle("active", a.dataset.page === page); });
 
     if (page === "devices") {
+      dock.place(null);
       if (!D) { loadDevices(); return; }
       pageEl.innerHTML = renderDevices();
       paintPairing();
@@ -473,17 +691,13 @@ FACEID_TOKEN=… curl -s -X POST ${esc(origin)}/api/device/recognized \\
       keepDevicesFresh();
       return;
     }
-    if (page === "access" && document.getElementById("rec-video")) {
-      // Keep the running camera: only refresh the dynamic parts.
-      document.getElementById("manual-list").innerHTML = manualList();
-      document.getElementById("access-journal").innerHTML = journal(S.logs);
-      return;
-    }
-    kiosk.unmount();
+    if (shell === before && (LIVES[page] || []).length) { paint(); return; }   // le direct, sans casser la saisie en cours
+    shell = before;
+    dock.place(null);                    // la caméra vit dans son propre noeud : on le gare avant de réécrire la page
     pageEl.innerHTML = { overview: renderOverview, members: renderMembers, access: renderAccess, settings: renderSettings }[page]();
     applyBarHeights(pageEl);
     refreshVoiceInfo();
-    if (page === "access") kiosk.mount();
+    dock.place(pageEl.querySelector("#dock-slot"), page === "access");
     if (page === "members" && pendingCapture) {
       const m = S.members.find((x) => x.id === pendingCapture);
       pendingCapture = null;
@@ -492,15 +706,34 @@ FACEID_TOKEN=… curl -s -X POST ${esc(origin)}/api/device/recognized \\
   }
 
   async function refresh() {
-    const r = await api("/api/state");
+    const r = await api("/api/state?days=" + days);
     if (!r.ok) { if (r.code !== 401) flash(r.message, "error"); return; }
     S = r.data;
-    // The devices board shows what another screen is doing right now: never render it from a cache.
+    head = S.head || 0;                  // le direct repart d'ici : rien ne sera annoncé deux fois
     if (page === "devices") { D = null; render(); await loadDevices(); return; }
     render();
+    startLive();
+    // La caméra ne se demande pas, et elle n'est pas lancée avant l'authentification : elle
+    // s'ouvre dès que l'espace est chargé, quel que soit l'onglet affiché.
+    if (!cameraBooted) { cameraBooted = true; dock.ensure(); }
   }
 
   // ---- Actions ---------------------------------------------------------------
+  // Recherche, filtres, tri : la réponse est immédiate et ne repasse pas par le serveur.
+  let searchTimer = null;
+  pageEl.addEventListener("input", (event) => {
+    const box = event.target.closest('[data-action="search"]');
+    if (box) {
+      const where = box.dataset.target;
+      view[where].q = box.value;
+      if (where === "members") { view.members.page = 1; paintLive("members"); }
+      else { clearTimeout(searchTimer); searchTimer = setTimeout(() => paintLive("journal"), 160); }
+      return;
+    }
+    const sort = event.target.closest('[data-action="sort"]');
+    if (sort) { view.members.sort = sort.value; view.members.page = 1; paintLive("members"); }
+  });
+
   pageEl.addEventListener("submit", async (event) => {
     const pairForm = event.target.closest("#pair-form");
     if (pairForm) {
@@ -534,10 +767,48 @@ FACEID_TOKEN=… curl -s -X POST ${esc(origin)}/api/device/recognized \\
   });
 
   pageEl.addEventListener("click", async (event) => {
-    const chip = event.target.closest(".chip");
+    const chip = event.target.closest(".quick-dates .chip");
     if (chip) {
       const input = document.getElementById(chip.closest(".quick-dates").dataset.target);
       input.value = addPeriod(S.today, { days: Number(chip.dataset.days || 0), months: Number(chip.dataset.months || 0) });
+      return;
+    }
+    // Période, filtre, page : l'écran change d'avis tout seul, sans recharger la page.
+    const tab = event.target.closest('[data-action="period"]');
+    if (tab) {
+      days = Math.min(90, Math.max(1, Number(tab.dataset.days) || 7));
+      store.set("faceid.days", days);
+      pageEl.querySelectorAll('[data-action="period"]').forEach((b) => b.setAttribute("aria-pressed", String(Number(b.dataset.days) === days)));
+      const r = await api("/api/state?days=" + days);
+      if (!r.ok) { flash(r.message, "error"); return; }
+      S = r.data;
+      head = Number(S.head || 0);
+      paint();
+      flash("Période : " + (days === 1 ? "aujourd'hui" : days + " jours"), "success", S.period.granted + " autorisé(s) et " + S.period.refused + " refus du " + S.period.from + " au " + S.period.to + ".");
+      return;
+    }
+    const chip2 = event.target.closest('[data-action="filter"]');
+    if (chip2) {
+      const where = chip2.dataset.target;
+      view[where].state = chip2.dataset.value;
+      if (where === "members") view.members.page = 1;
+      chip2.closest(".filters").querySelectorAll(".chip").forEach((c) => c.setAttribute("aria-pressed", String(c.dataset.value === view[where].state)));
+      paintLive(where === "members" ? "members" : "journal");
+      return;
+    }
+    const pager = event.target.closest('[data-action="pager"]');
+    if (pager) {
+      view.members.page = Math.max(1, Number(pager.dataset.page) || 1);
+      paintLive("members");
+      return;
+    }
+    const jump = event.target.closest('[data-action="goto"]');
+    if (jump) { location.hash = jump.dataset.goto; return; }
+    if (event.target.closest('[data-action="journal-help"]')) {
+      Toast.show({
+        kind: "info", title: "Comment lire ce journal", duration: 14000, meta: sec().label,
+        body: "Une ligne = une tentative devant une caméra ou un valideur manuel. « Autorisé » veut dire reconnue ET à jour de " + sec().access.toLowerCase() + ". Un refus n'est jamais une panne du système : c'est la règle de l'espace qui a protégé l'entrée.",
+      });
       return;
     }
     if (event.target.closest(".js-voice-toggle")) { toggleVoice(); return; }
@@ -552,6 +823,33 @@ FACEID_TOKEN=… curl -s -X POST ${esc(origin)}/api/device/recognized \\
       return;
     }
     if (action === "pair-print") { window.print(); return; }
+    if (action === "export-csv") { await exportCsv(btn); return; }
+    if (action === "notify-ask" || action === "notify-test") {
+      if (typeof Notification === "undefined") { flash("Ce navigateur ne propose pas de notifications système", "warn", "Les fiches de l'espace et la voix du kiosque restent actives."); return; }
+      if (action === "notify-ask") {
+        let permission = Notification.permission;
+        try { permission = await Notification.requestPermission(); } catch (_) { permission = Notification.permission; }
+        store.set(NOTIFY_KEY, permission === "granted" ? "on" : "off");
+        flash(permission === "granted" ? "Notifications système activées" : "Le navigateur refuse les notifications système ici", permission === "granted" ? "success" : "warn", permission === "granted" ? "Chaque passage préviendra l'écran, même en arrière-plan d'onglet." : "Les fiches et la voix du kiosque continuent de prévenir sur place.");
+        render();
+        return;
+      }
+      notify(sec().person + " vu(e) au poste de démonstration", "Sacha : " + (sec().rule === "attendance" ? "pointage" : "accès") + " autorisé à " + clock() + ".");
+      Toast.passage({ status: "granted", name: "Sacha (test)", message: "C'est exactement ce que cette fiche affichera au prochain passage réel.", time: clock(), device: "poste de démonstration", hero: false });
+      return;
+    }
+    if (action === "camera-test") {
+      await dock.ensure(true);
+      flash(dock.running() ? "Caméra de ce poste active" : "La caméra refuse encore de s'ouvrir", dock.running() ? "success" : "warn", dock.running() ? "Le mode automatique analyse à nouveau dans ce navigateur : aucune image ne sort du poste." : "Le poste réessaie seul toutes les quelques secondes ; vérifiez le petit cadenas de la barre d'adresse.");
+      return;
+    }
+    if (action === "revoke-all") {
+      if (window.confirm && !window.confirm("Révoquer tous les appareils reliés ? Leurs kiosques cessent de fonctionner immédiatement.")) return;
+      const r = await api("/api/devices/revoke-all", {});
+      flash(r.message, r.ok ? "success" : "error");
+      if (r.ok) { D = null; await refresh(); }
+      return;
+    }
     if (action === "pair-cancel") {
       const r = await api("/api/devices/pairing/cancel", { code: btn.dataset.code });
       if (pendingPair && pendingPair.code === btn.dataset.code) pendingPair = null;
@@ -572,8 +870,85 @@ FACEID_TOKEN=… curl -s -X POST ${esc(origin)}/api/device/recognized \\
     const r = await api("/api/members/" + id + "/" + action, {});
     btn.disabled = false;
     flash(r.message, r.ok ? "success" : "error");
-    if (r.ok || r.status === "already") { await refresh(); if (action === "revoke") kiosk.reloadKnown(); }
+    if (r.ok || r.status === "already") {
+      if (action === "revoke") dock.forget(Number(id));
+      await refresh();
+      if (action === "delete") dock.refreshFeed();
+    }
   });
+
+  // Un clic sur « Exporter » vaut une période entière : le navigateur ne garde qu'un extrait sous
+  // la main, le serveur en renvoie jusqu'à 5000 lignes, en CSV prêt pour Excel comme pour Sheets.
+  async function exportCsv(btn) {
+    btn.disabled = true;
+    const r = await api("/api/journal?days=" + days);
+    btn.disabled = false;
+    if (!r.ok) { flash(r.message, "error"); return; }
+    const rows = r.data.rows || [];
+    if (!rows.length) { flash("Aucun " + sec().entry.toLowerCase() + " sur cette période", "warn", "Rien à exporter : le fichier serait vide."); return; }
+    const body = ["date;heure;personne;methode;statut;retard;poste"].concat(rows.map((x) => [
+      x.local_date, x.local_time, String(x.name || "").replace(/[;\n]/g, " "), x.method, x.status === "granted" ? "autorise" : "refuse", x.late ? "oui" : "non", x.device_name || "ce poste",
+    ].join(";"))).join("\r\n");
+    if (typeof Blob === "undefined" || typeof URL === "undefined" || typeof URL.createObjectURL !== "function") {
+      flash("Export prêt, mais ce navigateur bloque le téléchargement local", "warn", rows.length + " lignes · " + r.data.from + " → " + r.data.to + ".");
+      return;
+    }
+    const url = URL.createObjectURL(new Blob(["\ufeff" + body], { type: "text/csv;charset=utf-8" }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "faceid-" + r.data.from + "-" + r.data.to + ".csv";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => { try { URL.revokeObjectURL(url); } catch (_) { /* déjà libéré */ } }, 5000);
+    flash(rows.length + " " + sec().entries.toLowerCase() + " exportés", "success", "Période " + r.data.from + " → " + r.data.to + " · " + r.data.count + " lignes lues côté serveur.");
+  }
+
+  // ---- Le direct ------------------------------------------------------------------
+  // Une seule boucle douce : le serveur ne renvoie que ce qui est paru depuis le dernier pointeur,
+  // donc tant que rien ne passe on ne touche à aucun pixel. Une ligne fraîche = une fiche, un son,
+  // une notification système. C'est ce qui remplace le « rafraîchissez la page pour voir ».
+  let clockTimer = null;
+  function startLive() {
+    clearTimeout(pollTimer);
+    if (!S || document.hidden) return;
+    if (!alive()) return;
+    pollTimer = setTimeout(liveTick, 5000);
+  }
+  async function liveTick() {
+    clearTimeout(pollTimer);
+    if (!S || document.hidden || !alive()) return;
+    pollTimer = setTimeout(liveTick, 5000);
+    const r = await api("/api/state?days=" + days + (head ? "&since=" + head : ""));
+    if (!r.ok || !r.data) return;
+    const d = r.data;
+    const fresh = (d.logs || []).slice().reverse();     // le serveur répond du plus récent au plus ancien
+    const moved = Number(d.head || 0) !== head;
+    S = Object.assign(S, { kpis: d.kpis, chart: d.chart, period: d.period, devices: d.devices, members: d.members, attendance: d.attendance, logs: moved ? S.logs.concat(fresh).slice(0, 40) : S.logs });
+    paint();
+    if (!moved) return;
+    head = Number(d.head || 0);
+    for (const row of fresh) {
+      const granted = row.status === "granted";
+      Toast.passage({ status: granted ? "granted" : "expired", name: row.name, message: row.message, time: row.local_time, device: row.device_name || "poste relié", person: sec().person, hero: false });
+      notify((granted ? sec().person + " vu(e) au " : "Accès refusé au ") + (row.device_name || "poste relié"), row.message || "");
+      speak(granted ? "granted" : "expired", row.name, 20000);
+    }
+  }
+
+  // L'horloge du fuseau de l'entreprise, posée sur l'écran qui le règle : un coup d'œil suffit pour
+  // vérifier que « Africa/Algiers » veut bien dire la même heure que les gens du comptoir.
+  function clockTick() {
+    clearTimeout(clockTimer);
+    const el = pageEl.querySelector("[data-tz]");
+    if (!el) return;
+    let text = "";
+    try { text = new Date().toLocaleTimeString("fr-FR", { timeZone: el.dataset.tz, hour: "2-digit", minute: "2-digit", second: "2-digit" }); } catch (_) { text = "—"; }
+    el.textContent = text;
+    const note = pageEl.querySelector("#tz-note");
+    if (note) note.textContent = text === "—" ? "fuseau refusé par ce navigateur" : "le journal est horodaté sur ce fuseau";
+    if (alive()) clockTimer = setTimeout(clockTick, 1000);
+  }
 
   // The devices page is a live board: an apparatus that just came online should show up.
   // A timeout chain, not an interval — a timer that never ends would keep the page (and the
@@ -582,12 +957,20 @@ FACEID_TOKEN=… curl -s -X POST ${esc(origin)}/api/device/recognized \\
   function keepDevicesFresh() {
     clearTimeout(liveTimer);
     if (page !== "devices" || !S || document.hidden) return;
+    if (!alive()) return;
     liveTimer = setTimeout(async () => { await loadDevices(); keepDevicesFresh(); }, 20000);
   }
 
   document.getElementById("logout").addEventListener("click", async () => { await api("/api/logout", {}); location.href = "/"; });
   window.addEventListener("hashchange", () => { const p = location.hash.slice(1); if (PAGES.includes(p) && p !== page) { page = p; if (p === "devices") D = null; if (S) render(); } });
-  document.addEventListener("visibilitychange", () => { if (page === "devices") { if (document.hidden) clearTimeout(liveTimer); else keepDevicesFresh(); } });
+  document.addEventListener("visibilitychange", () => {
+    if (page === "devices") { if (document.hidden) clearTimeout(liveTimer); else keepDevicesFresh(); }
+    if (document.hidden) { clearTimeout(pollTimer); return; }
+    startLive();
+    // Un onglet qu'on rouvre doit retrouver sa caméra et son direct, pas un écran figé.
+    if (cameraBooted) dock.ensure();
+    clockTick();
+  });
 
   // ---- Enrollment dialog -----------------------------------------------------
   const enrollDialog = (() => {
@@ -633,7 +1016,8 @@ FACEID_TOKEN=… curl -s -X POST ${esc(origin)}/api/device/recognized \\
       setStatus(statusEl, result.message, result.ok ? "ok" : "error");
       if (result.ok) {
         speak("enrolled");
-        kiosk.reloadKnown();
+        dock.refreshFeed();
+        dock.reloadKnown();
         setTimeout(async () => { close(); await refresh(); }, 1800);
         return;
       }
@@ -654,110 +1038,301 @@ FACEID_TOKEN=… curl -s -X POST ${esc(origin)}/api/device/recognized \\
     return { open, close };
   })();
 
-  // ---- Recognition kiosk: detection + matching in the browser ----------------
-  const kiosk = (() => {
-    let video, statusEl, startBtn, checkBtn, autoBox, banner, bannerTitle, bannerText, live;
-    let timer = null, busy = false, known = [], knownAt = 0, mounted = false, lastResult = null;
-    const recentlySent = new Map();
+  // ---- Le poste live : la caméra de ce poste, tout le temps ------------------
+  // Un seul flux, un seul moteur, une seule boucle. Le panneau est créé une fois pour
+  // toutes puis *déplacé* d'écran en écran : changer d'onglet ne coupe ni la caméra ni
+  // le compteur. Personne n'appuie sur « Activer la caméra » : elle s'active, se
+  // réessaie toute seule si la permission tarde ou si le poste se met en veille.
+  const dock = (() => {
+    const AUTO_KEY = "faceid.auto";
+    const PAUSE_MS = 60000;      // une pause demandée à la main se lève toute seule au bout d'une minute
     const TITLES = () => ({
       granted: ({ office: "POINTAGE ENREGISTRÉ", canteen: "BON APPÉTIT" })[sector] || "ACCÈS AUTORISÉ",
       already: "DÉJÀ ENREGISTRÉ AUJOURD'HUI",
       expired: ({ office: "CONTRAT EXPIRÉ", canteen: "INSCRIPTION EXPIRÉE", coworking: "ACCÈS EXPIRÉ" })[sector] || "ABONNEMENT EXPIRÉ",
-      unknown: "VISAGE INCONNU", no_face: "En attente d'un visage…", multi_face: "Une personne à la fois", error: "Erreur", idle: "Caméra inactive", scanning: "Analyse en cours…", loading: "Chargement du moteur…",
+      unknown: "VISAGE INCONNU", no_face: "En attente d'un visage…", multi_face: "Une personne à la fois",
+      error: "Analyse impossible", idle: "Caméra en pause", scanning: "Analyse en cours…", loading: "Chargement du moteur…",
     });
-    function showBanner(status, text) { if (!banner) return; banner.className = "banner banner-" + status; bannerTitle.textContent = TITLES()[status] || status; bannerText.textContent = text || ""; }
+    // Le mode automatique est LA façon dont ce produit doit tourner : activé d'office,
+    // et le refus explicite de l'utilisateur est la seule chose qui le coupe (pour une heure max).
+    const wantsAuto = () => { try { return localStorage.getItem(AUTO_KEY) !== "off"; } catch (_) { return true; } };
+
+    let host = null, holder = null, e = {};
+    let stream = null, known = [], knownAt = 0, busy = false, lastResult = null, lastToast = null;
+    let chain = null, watchdog = null, attempts = 0, pausedUntil = 0, started = false, wakeLock = null;
+    const recentlySent = new Map();
+
+    function build() {
+      if (host) return;
+      host = document.createElement("section");
+      host.className = "live-dock";
+      host.innerHTML = `
+        <div class="dock-shell">
+          <div class="dock-cam">
+            <div class="video-wrap">
+              <video id="rec-video" autoplay playsinline muted></video>
+              <div id="rec-banner" class="banner banner-idle" role="status" aria-live="assertive">
+                <strong id="rec-banner-title">Caméra du poste</strong>
+                <span id="rec-banner-text">Activation…</span>
+              </div>
+            </div>
+            <div class="kiosk-controls">
+              <button class="btn btn-ghost btn-sm" type="button" id="rec-start">Mettre en pause</button>
+              <button class="btn btn-primary btn-sm" type="button" id="rec-check" disabled>Vérifier maintenant</button>
+              <label class="switch"><input type="checkbox" id="rec-auto"> Mode automatique</label>
+              <button class="btn btn-link btn-sm js-voice-toggle" type="button" aria-pressed="true" title="Annonces vocales">🔊 Voix</button>
+            </div>
+            <p id="rec-status" class="status" aria-live="polite"></p>
+          </div>
+          <div class="dock-side">
+            <p class="dock-title"><span class="dot-live" id="dock-dot"></span> Passages vus par ce poste <span class="badge" id="dock-count">0</span></p>
+            <ul id="rec-live" class="live-list" aria-label="Derniers résultats"></ul>
+            <small class="muted js-voice-info"></small>
+          </div>
+        </div>`;
+      holder = document.createElement("div");
+      holder.className = "dock-holder";
+      holder.hidden = true;
+      document.body.appendChild(holder);
+      holder.appendChild(host);
+      e = {
+        video: host.querySelector("#rec-video"), status: host.querySelector("#rec-status"),
+        start: host.querySelector("#rec-start"), check: host.querySelector("#rec-check"),
+        auto: host.querySelector("#rec-auto"), banner: host.querySelector("#rec-banner"),
+        title: host.querySelector("#rec-banner-title"), text: host.querySelector("#rec-banner-text"),
+        live: host.querySelector("#rec-live"), dot: host.querySelector("#dock-dot"), count: host.querySelector("#dock-count"),
+      };
+      e.auto.checked = wantsAuto();
+      e.start.addEventListener("click", () => (stream ? pause("manuelle") : resume(true)));
+      e.check.addEventListener("click", () => { showBanner("scanning", ""); check(); });
+      e.auto.addEventListener("change", () => {
+        try { localStorage.setItem(AUTO_KEY, e.auto.checked ? "on" : "off"); } catch (_) { /* navigation privée */ }
+        if (e.auto.checked) { say("Mode automatique : les visages sont analysés en continu dans ce navigateur."); speak("auto_on"); lastSpoken.clear(); loop(); }
+        else { stopChain(); say("Mode automatique arrêté. Il reprendra tout seul à la prochaine reprise de la caméra."); speak("auto_off"); }
+      });
+      // Un écran qui revient du fond de la scène doit retrouver sa caméra, pas un poste à réveiller à la main.
+      document.addEventListener("visibilitychange", () => {
+        if (document.hidden) { stopChain(); return; }
+        keepAwake();
+        if (!pausedUntil) { acquire().then((ok) => { if (ok && wantsAuto()) loop(); }); }
+      });
+      window.addEventListener("pagehide", hardStop);
+    }
+
+    function place(slot, wide) {
+      build();
+      if (!slot) { holder.appendChild(host); host.hidden = true; return; }
+      slot.appendChild(host);
+      host.hidden = false;
+      host.classList.toggle("is-wide", Boolean(wide));
+      host.classList.toggle("is-compact", !wide);
+    }
+
+    function showBanner(status, text) {
+      e.banner.className = "banner banner-" + status;
+      e.title.textContent = TITLES()[status] || status;
+      e.text.textContent = text || "";
+    }
+    function say(text, kind) { e.status.textContent = text || ""; e.status.className = "status" + (kind ? " " + kind : ""); }
+    function online(on) { e.dot.classList.toggle("on", Boolean(on)); syncBar(on); }
+    function stopChain() { if (chain) clearTimeout(chain); chain = null; }
+    function hardStop() { stopChain(); if (watchdog) clearInterval(watchdog); watchdog = null; stopCamera(e.video); stream = null; }
+    function schedule(ms, what) { stopChain(); if (!alive()) return; chain = setTimeout(() => { if (alive()) what(); }, ms); }
+
+    async function keepAwake() {
+      if (!navigator.wakeLock || wakeLock) return;
+      try {
+        wakeLock = await navigator.wakeLock.request("screen");
+        wakeLock.addEventListener?.("release", () => { wakeLock = null; });
+      } catch (_) { wakeLock = null; /* veille refusée : rien de grave, la caméra tourne quand même */ }
+    }
+
+    // --- la caméra, coûte que coûte -----------------------------------------
+    async function acquire() {
+      if (stream) return true;
+      if (pausedUntil) return false;
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        showBanner("error", "Ce navigateur ne donne pas accès à une caméra.");
+        say("Ce navigateur ne peut pas ouvrir de caméra : utilisez Chrome, Edge ou Safari sur le poste de l'entrée.", "error");
+        return false;
+      }
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } }, audio: false });
+        e.video.srcObject = stream;
+        await e.video.play().catch(() => {});
+        // une track qui meurt (câble débranché, mise en veille, autre app) se reprend seule
+        for (const track of stream.getTracks()) track.onended = () => { stream = null; online(false); schedule(1500, () => acquire().then((ok) => { if (ok) boot(); })); };
+        attempts = 0;
+        online(true);
+        return true;
+      } catch (err) {
+        stream = null;
+        e.video.srcObject = null;
+        online(false);
+        retry(err);
+        return false;
+      }
+    }
+    function retry(err) {
+      attempts += 1;
+      const wait = Math.min(20000, 1200 * 2 ** Math.min(attempts, 4));
+      const why = !window.isSecureContext ? "La caméra exige du HTTPS (ou http://localhost)."
+        : err && err.name === "NotAllowedError" ? "Autorisez la caméra dans la barre d'adresse : le poste réessaie tout seul."
+        : err && err.name === "NotReadableError" ? "Une autre application tient la caméra : on réessaie."
+        : err && (err.name === "NotFoundError" || err.name === "OverconstrainedError") ? "Aucune caméra détectée sur ce poste."
+        : "Caméra indisponible pour l'instant.";
+      showBanner("error", attempts > 1 ? `Nouvel essai dans ${Math.round(wait / 1000)} s (essai ${attempts}).` : why);
+      say(why + " Le kiosque ne s'arrête pas d'essayer.", "error");
+      if (attempts === 1) {
+        Toast.system({
+          ok: false, kind: "camera", title: "La caméra de ce poste n'est pas encore ouverte", body: why + " Rien à reprogrammer : ce poste réessaie seul, toutes les quelques secondes.",
+          duration: 12000, action: { label: "Réessayer tout de suite", onClick: () => { attempts = 0; acquire().then((ok) => ok && boot()); } },
+        });
+      }
+      schedule(wait, () => acquire().then((ok) => { if (ok) boot(); }));
+    }
+
+    // --- moteur + visages connus + boucle ------------------------------------
+    async function boot() {
+      try {
+        await FaceEngine.load((msg) => showBanner("loading", msg));
+        await reloadKnown();
+        e.check.disabled = false;
+        e.auto.disabled = false;
+        showBanner("no_face", known.length ? known.length + " visage(s) chargé(s) sur ce poste. Placez-vous devant la caméra." : "Aucun visage enregistré : capturez vos " + sec().people + " d'abord.");
+        say("Moteur " + FaceEngine.backend() + " · " + known.length + " visage(s) connus · " + (S ? S.devices.online + " kiosque(s) en ligne" : "") + ".");
+        if (attempts === 0 && started !== true) Toast.system({ ok: true, title: "Caméra de ce poste active", body: "Le mode automatique tourne : chaque visage est analysé ici, aucune image ne sort de ce poste.", duration: 3600, sound: false });
+        started = true;
+        if (wantsAuto()) { e.auto.checked = true; loop(); }
+        if (!watchdog) watchdog = setTimeout(beat, 12000);
+      } catch (err) {
+        showBanner("error", "Moteur facial indisponible.");
+        say(String(err && err.message ? err.message : err), "error");
+        schedule(8000, boot);
+      }
+    }
+    // Une chaîne de minuteurs, jamais setInterval : une page fermée doit pouvoir mourir
+    // (les tests jsdom, comme un onglet qu'on laisse dans le vide de la mémoire).
+    function beat() {
+      watchdog = null;
+      if (!alive()) return;
+      sweep();
+      if (alive() && !pausedUntil) watchdog = setTimeout(beat, 12000);
+    }
+    // Le veilleur : un poste d'entrée doit se remettre en marche tout seul, sans personne.
+    function sweep() {
+      if (!alive() || document.hidden || pausedUntil) return;
+      const stalled = !stream || e.video.paused || e.video.readyState === 0;
+      if (stalled) { acquire().then((ok) => { if (ok && wantsAuto() && !chain) loop(); }); return; }
+      if (wantsAuto() && !chain) loop();
+      keepAwake();
+    }
+    async function reloadKnown() {
+      const feed = await api("/api/descriptors");
+      if (feed && feed.ok) { known = feed.data.members || []; knownAt = Date.now(); e.count.textContent = String(known.length); }
+      return feed ? feed.ok : false;
+    }
     function pushLive(result) {
       if (!["granted", "already", "expired", "unknown"].includes(result.status)) return;
       const li = document.createElement("li");
       li.className = "live-" + result.status;
-      li.textContent = new Date().toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit", second: "2-digit" }) + " — " + (result.name || "Inconnu") + " — " + TITLES()[result.status];
-      live.prepend(li);
-      while (live.children.length > 6) live.removeChild(live.lastChild);
+      li.textContent = new Date().toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit", second: "2-digit" }) + " — " + (result.name || "Inconnu") + " — " + (TITLES()[result.status] || result.status);
+      e.live.prepend(li);
+      while (e.live.children.length > 6) e.live.removeChild(e.live.lastChild);
     }
-    async function reloadKnown() {
-      const r = await api("/api/descriptors");
-      if (r.ok) { known = r.data.members; knownAt = Date.now(); }
-      return r.ok;
-    }
+
     async function check() {
-      if (busy || !video || !video.srcObject) return null;
-      busy = true; checkBtn.disabled = true;
-      let result;
+      if (busy || !stream) return null;
+      busy = true; e.check.disabled = true;
+      let result = null;
       try {
         if (Date.now() - knownAt > 60000) await reloadKnown();
-        const face = await FaceEngine.describe(video, { single: false });
-        if (face.status !== "ok") result = { ok: false, code: 422, status: face.status, reason: face.reason, message: hintMessage(face) };
-        else {
+        const face = await FaceEngine.describe(e.video, { single: false });
+        if (face.status !== "ok") {
+          result = { ok: false, code: 422, status: face.status, reason: face.reason, message: hintMessage(face) };
+        } else {
           const match = FaceEngine.match(face.descriptor, known);
           if (!match) result = { ok: false, code: 404, status: "unknown", message: known.length ? "Visage non reconnu : personne non enregistrée dans votre espace." : "Aucun visage enregistré : capturez d'abord vos " + sec().people + "." };
-          else if (Date.now() - (recentlySent.get(match.member.id) || 0) < 4000) result = null; // same person, already handled seconds ago
+          // La même personne revu(e) dans la demi-minute ne refait pas un passage, ni une fiche.
+          else if (Date.now() - (recentlySent.get(match.member.id) || 0) < 20000) result = null;
           else {
             recentlySent.set(match.member.id, Date.now());
             result = await api("/api/recognized", { member_id: match.member.id, distance: Math.round(match.distance * 1000) / 1000 });
-            if (result.ok || ["expired", "already"].includes(result.status)) refresh();
           }
         }
-      } catch (err) { result = { ok: false, code: 0, status: "error", message: "Analyse impossible : " + err.message }; }
-      busy = false; checkBtn.disabled = !video.srcObject;
+      } catch (err) {
+        result = { ok: false, code: 0, status: "error", message: "Analyse impossible : " + (err && err.message ? err.message : err) };
+      }
+      busy = false;
+      e.check.disabled = !stream;
       if (!result) { if (lastResult) showBanner(lastResult.status, lastResult.message); return { status: "skip" }; }
       lastResult = result;
       showBanner(result.status, result.message);
-      setStatus(statusEl, result.status === "no_face" ? "" : result.message, result.ok ? "ok" : result.status === "no_face" ? "" : "error");
+      say(result.status === "no_face" ? "" : result.message, result.ok ? "ok" : result.status === "no_face" ? "" : "error");
       pushLive(result);
       speakResult(result);
+      // Un visage qui traîne devant le capteur ne doit pas remplir le bord d'écran de fiches
+      // identiques : même verdict, même personne, moins de quinze secondes => on se tait.
+      const same = lastToast && lastToast.status === result.status && (result.member_id || 0) === (lastToast.member_id || 0) && Date.now() - lastToast.at < 15000;
+      if (!same && ["granted", "already", "expired", "unknown"].includes(result.status)) {
+        lastToast = { status: result.status, member_id: result.member_id || 0, at: Date.now() };
+        Toast.passage({ status: result.status, name: result.name, message: result.message, time: result.local_time, confidence: result.confidence, member_id: result.member_id, device: "ce poste", person: sec().person, sound: false });
+      }
+      if (result.ok || ["expired", "already"].includes(result.status)) refresh();
       return result;
     }
-    const stopAuto = () => { if (timer) clearTimeout(timer); timer = null; };
     async function loop() {
-      timer = null;
-      if (!mounted || !autoBox.checked || !video.srcObject) return;
+      chain = null;
+      if (!alive() || document.hidden || !e.auto.checked || !stream) return;
       let delay = 700;
-      if (!document.hidden) {
-        const t0 = performance.now();
-        const result = await check();
-        const spent = performance.now() - t0;
-        if (result && ["granted", "already", "expired", "unknown"].includes(result.status)) delay = 3000;
-        else if (result && result.status === "error") delay = 5000;
-        else delay = Math.max(500, Math.min(2500, spent * 0.5));
-      }
-      if (mounted && autoBox.checked && video.srcObject) timer = setTimeout(loop, delay);
+      const t0 = performance.now();
+      const result = await check();
+      const spent = performance.now() - t0;
+      if (result && ["granted", "already", "expired", "unknown"].includes(result.status)) delay = 3000;
+      else if (result && result.status === "error") delay = 5000;
+      else delay = Math.max(500, Math.min(2500, spent * 0.5));
+      if (alive() && !document.hidden && e.auto.checked && stream) chain = setTimeout(loop, delay);
     }
-    async function toggleCamera() {
-      if (video.srcObject) {
-        stopAuto(); autoBox.checked = false; autoBox.disabled = true; stopCamera(video);
-        startBtn.textContent = "Activer la caméra"; checkBtn.disabled = true;
-        showBanner("idle", "Cliquez sur « Activer la caméra »."); setStatus(statusEl, ""); speak("camera_off");
-        return;
-      }
-      showBanner("scanning", "Demande d'autorisation…");
-      const stream = await startCamera(video, statusEl);
-      if (!stream) { showBanner("error", "Caméra indisponible."); speak("camera_denied"); return; }
-      speak("camera_on");
-      showBanner("loading", "Première utilisation : téléchargement du moteur facial.");
-      try {
-        await FaceEngine.load((msg) => setStatus(statusEl, msg));
-        await reloadKnown();
-        startBtn.textContent = "Couper la caméra"; checkBtn.disabled = false; autoBox.disabled = false;
-        showBanner("no_face", "Placez le visage au centre de l'image.");
-        setStatus(statusEl, "Caméra active (moteur " + FaceEngine.backend() + ", " + known.length + " visage(s) connus). Cliquez sur « Vérifier maintenant » ou activez le mode automatique.");
-      } catch (err) { showBanner("error", "Moteur facial indisponible."); setStatus(statusEl, err.message, "error"); }
+
+    // --- pause / reprise ------------------------------------------------------
+    function pause(why) {
+      pausedUntil = Date.now() + PAUSE_MS;
+      stopChain();
+      stopCamera(e.video);
+      stream = null;
+      online(false);
+      e.start.textContent = "Reprendre maintenant";
+      e.check.disabled = true;
+      showBanner("idle", why === "manuelle" ? "Pause d'une minute : ce poste reprendra tout seul." : "En attente du matériel.");
+      say("Caméra en pause. Reprise automatique dans une minute — ou tout de suite avec « Reprendre maintenant ».");
+      schedule(PAUSE_MS, () => resume(false));
     }
-    function mount() {
-      video = document.getElementById("rec-video"); statusEl = document.getElementById("rec-status"); startBtn = document.getElementById("rec-start");
-      checkBtn = document.getElementById("rec-check"); autoBox = document.getElementById("rec-auto"); banner = document.getElementById("rec-banner");
-      bannerTitle = document.getElementById("rec-banner-title"); bannerText = document.getElementById("rec-banner-text"); live = document.getElementById("rec-live");
-      mounted = true;
-      startBtn.addEventListener("click", toggleCamera);
-      checkBtn.addEventListener("click", () => { showBanner("scanning", ""); check(); });
-      autoBox.addEventListener("change", () => {
-        stopAuto();
-        if (autoBox.checked) { setStatus(statusEl, "Mode automatique actif : les visages sont analysés en continu dans ce navigateur."); speak("auto_on"); lastSpoken.clear(); loop(); }
-        else { setStatus(statusEl, "Mode automatique arrêté."); speak("auto_off"); }
-      });
+    async function resume(now) {
+      pausedUntil = 0;
+      clearTimeout(chain); chain = null;
+      e.start.textContent = "Mettre en pause";
+      showBanner("loading", "Réveil de la caméra…");
+      if (!(await acquire())) return;
+      await boot();
+      if (!now && wantsAuto()) speak("auto_on");
     }
-    function unmount() { if (!mounted) return; stopAuto(); stopCamera(video); mounted = false; video = banner = null; }
-    window.addEventListener("pagehide", unmount);
-    return { mount, unmount, reloadKnown };
+
+    async function ensure(force) {
+      build();
+      keepAwake();
+      Toast.unlock();
+      if (force) { pausedUntil = 0; attempts = 0; e.start.textContent = "Mettre en pause"; }
+      if (!(await acquire())) return;
+      await boot();
+    }
+    return {
+      ensure, place, pause, resume,
+      reloadKnown: () => reloadKnown(),
+      refreshFeed: () => { knownAt = 0; },
+      running: () => Boolean(stream),
+      // Un visage vient d'être capturé ou effacé : le poste doit le savoir tout de suite.
+      forget: (id) => { known = known.filter((m) => m.id !== id); e.count.textContent = String(known.length); },
+    };
   })();
 
   refresh();

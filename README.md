@@ -24,10 +24,10 @@ functions/api/[[route]].js API JSON : comptes, membres, enrôlement, reconnaissa
 tools/kiosk-relay.py       relais sur site pour caméra IP / boîtier sans navigateur (jeton Bearer)
 schema.sql                 schéma D1 (créé automatiquement au premier appel)
 tests/binding.test.mjs     6 tests du câblage D1 (mauvais type de liaison → message clair)
-tests/cloudflare.test.mjs  15 tests de bout en bout de l'API, dont le cycle complet d'un appareil relié
-tests/ui-flow.test.mjs     14 tests « vrai navigateur » : formulaires login/inscription,
-                           session, tableau de bord, capture, kiosque (npm run test:ui)
-tests/kiosk-ui.test.mjs    10 tests du kiosque relié et de l'écran « Appareils » (npm run test:kiosk)
+tests/cloudflare.test.mjs  17 tests de bout en bout de l'API, dont le cycle complet d'un appareil relié
+tests/ui-flow.test.mjs     18 tests « vrai navigateur » : formulaires login/inscription, session,
+                           tableau de bord, capture, poste live, notifications (npm run test:ui)
+tests/kiosk-ui.test.mjs    11 tests du kiosque relié et de l'écran « Appareils » (npm run test:kiosk)
 tests/test_relay.py        10 tests du relais caméra (pytest)
 ```
 
@@ -39,7 +39,7 @@ branche de production `main`. Détail pas à pas, dépannage de l'erreur SSL des
 npm install && npm run dev     # http://localhost:8788 avec une base D1 locale
 npm test                       # tests API (démarre un serveur wrangler local)
 npm run test:ui                # les pages jouées dans un DOM (jsdom) contre le serveur réel
-npm run test:kiosk             # le kiosque relié + l'écran « Appareils » (QR, code, révocation)
+npm run test:kiosk             # le kiosque relié (auto-reprise de la caméra) + l'écran « Appareils »
 npm run test:all               # les quatre suites
 ```
 
@@ -97,9 +97,24 @@ Commun à tous : même personne reconnue deux fois en moins d'une minute = un se
 ### Fonctionnalités
 - **Espace privé par entreprise (multi-tenant)** : chaque compte ne voit que ses propres personnes et passages (vérifié par tests).
 - **Inscription en 1 seconde** : taper le nom → « Ajouter et capturer » → la caméra s'ouvre, l'opérateur coche l'accord, compte à rebours 3-2-1, capture automatique (réessaie toute seule si personne n'est devant la caméra).
-- **Kiosque** : caméra du navigateur en mode automatique (vérification toutes les 1,5 s, bandeau vert/orange/rouge), ou validation manuelle sans caméra. Le plus grand visage est retenu si plusieurs personnes passent devant la caméra.
+- **Poste live, toujours allumé** : la caméra s'ouvre seule à l'entrée dans l'espace, sans bouton à
+  presser ; le mode automatique est activé par défaut et ne s'éteint jamais tout seul (une pause
+  demandée à la main se lève au bout d'une minute, et le bouton le dit). Un poste à qui l'on refuse
+  la caméra la redemande toutes les quelques secondes, en l'écrivant sur l'image. Le panneau de
+  direct suit la navigation : changer d'onglet ne coupe ni le flux ni le compteur. Validation
+  manuelle sans caméra toujours possible ; le plus grand visage est retenu si plusieurs personnes
+  passent devant la caméra.
+- **Notifications** : une pile de fiches en haut à droite (passage autorisé, refus, appareil relié,
+  caméra ou réseau en défaut) avec icône métier, compte à rebours visuel, action utile (« voir la
+  fiche », « réessayer maintenant »), au maximum quatre à l'écran, un seul exemplaire par sujet, et
+  un son désactivable d'un clic dans la barre du haut. Sur le kiosque, la fiche passe en mode « héros
+  » (lisable depuis le fond de la pièce) avec la voix féminine française.
+- **Direct sans F5** : l'espace s'aperçoit tout seul des passages enregistrés sur un autre poste
+  (son propre journal, ses indicateurs et sa ligne « en direct » suivent, toutes les 5 secondes) ;
+  le journal se filtre, se cherche, se trie, se met sur une période (jour / 7 / 30 / 90 jours) et
+  s'exporte en CSV.
 - **Annonces vocales (voix féminine, gratuites)** : « Caméra activée, permission accordée », « Approchez-vous de la caméra », « Bienvenue Amine, accès autorisé », « Bonjour Karim, pointage enregistré », « Bon appétit Yanis ! », « Déjà enregistré aujourd'hui », « Accès refusé, abonnement expiré »… Synthèse vocale du navigateur (voix « Google français », Hortense, Denise…) qui dit le prénom ; si le navigateur n'a pas de voix féminine française, des clips enregistrés (`web/static/voice/`) prennent le relais. Bouton 🔊 pour couper.
-- **Journal & tableau de bord** : indicateurs propres au secteur, graphique 7 jours, journal avec heure locale, résultat (Autorisé / Refusé / Retard).
+- **Journal & tableau de bord** : indicateurs propres au secteur, graphique à période choisie, journal avec heure locale, résultat (Autorisé / Refusé / Retard) et le poste d'où vient chaque passage.
 - **Biométrie avec accord** : l'empreinte faciale n'est enregistrée qu'après une case d'accord explicite, et peut être effacée à tout moment ; supprimer une fiche efface aussi son historique.
 
 ### Sécurité incluse

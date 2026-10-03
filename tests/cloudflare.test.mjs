@@ -238,7 +238,8 @@ test("office: settings, lateness and attendance board", async () => {
   assert.equal(state.attendance[0].name, "Karim");
   assert.equal(state.attendance[0].late, true);
   assert.equal(state.attendance[1].arrival, null);
-  assert.equal(state.logs[0].late, 1);
+  assert.equal(state.logs[0].late, true, "un retard, partout le même mot, partout un booléen");
+  assert.match(state.logs[0].message, /^Karim : pointage enregistré à \d\d:\d\d\.$/, "la phrase du kiosque est celle de l'écran");
 });
 
 test("login rate limit: per account and per visitor, but never a whole office", async () => {
@@ -310,6 +311,62 @@ function device(base = BASE) {
   }
   return { call, set token(v) { token = v; }, get token() { return token; } };
 }
+
+test("journal piloté par la période et par le pointeur du direct", async () => {
+  const c = client();
+  await signup(c, "fitness");
+  const a = (await c.call("/api/members", { name: "Nour", subscription_end: today })).data;
+  const b = (await c.call("/api/members", { name: "Sofiane", subscription_end: today })).data;
+  await c.call(`/api/members/${a.id}/entry`, {});
+  await c.call(`/api/members/${b.id}/entry`, {});
+
+  const week = (await c.call("/api/state?days=7")).data;
+  assert.equal(week.chart.length, 7, "sept jours par défaut");
+  assert.equal(week.chart[6].count, 2);
+  assert.equal(week.period.days, 7);
+  assert.equal(week.period.granted, 2, "la période porte son propre total");
+  assert.equal(week.devices.count, 0, "aucun kiosque relié pour l'instant");
+  assert.equal(week.logs.length, 2);
+  const head = week.head;
+  assert.ok(head >= 1, "le journal expose son dernier identifiant");
+
+  const month = (await c.call("/api/state?days=30")).data;
+  assert.equal(month.chart.length, 30, "une fenêtre plus large pour un vrai graphique de SaaS");
+  assert.equal(month.chart[29].count, 2);
+  assert.equal(month.chart[0].count, 0);
+  const clamped = (await c.call("/api/state?days=99999")).data;
+  assert.equal(clamped.period.days, 90, "la fenêtre est bornée : pas de requête infinie");
+  const junk = (await c.call("/api/state?days=abc")).data;
+  assert.equal(junk.period.days, 7, "une valeur aberrante retombe sur la semaine");
+
+  // le direct : depuis le dernier identifiant vu, uniquement les nouveautés
+  const quiet = (await c.call("/api/state?since=" + head)).data;
+  assert.equal(quiet.logs.length, 0, "rien de neuf, rien à notifier");
+  assert.equal(quiet.head, head, "le pointeur n'avance pas tout seul");
+  await c.call(`/api/members/${a.id}/entry`, {});   // même personne : doublon de 60 s → rien
+  assert.equal((await c.call("/api/state?since=" + head)).data.logs.length, 0, "un doublon ne notifie personne");
+  const third = (await c.call("/api/members", { name: "Lila", subscription_end: today })).data;
+  await c.call(`/api/members/${third.id}/entry`, {});
+  const fresh = (await c.call("/api/state?since=" + head)).data;
+  assert.equal(fresh.logs.length, 1, "le passage de Lila arrive seul");
+  assert.equal(fresh.logs[0].name, "Lila");
+  assert.ok(fresh.head > head, "et le pointeur repart pour la fois suivante");
+});
+
+test("l'espace voit d'un coup d'œil combien de kiosques tournent", async () => {
+  const c = client();
+  await signup(c, "coworking");
+  const before = (await c.call("/api/state")).data.devices;
+  assert.deepEqual(before, { count: 0, online: 0 });
+  const code = (await c.call("/api/devices/pairing", { name: "Réception" })).data.code;
+  assert.equal((await c.call("/api/state")).data.devices.count, 0, "un code en attente n'est pas un appareil");
+  const d = device();
+  assert.equal((await d.call("/api/pair", { code })).status, 200);
+  assert.equal((await d.call("/api/device/state")).status, 200, "le kiosque bat");
+  const after = (await c.call("/api/state")).data.devices;
+  assert.equal(after.count, 1);
+  assert.equal(after.online, 1, "vu dans les deux minutes : en ligne");
+});
 
 test("appairage : le code est court, daté, utilisable une fois", async () => {
   const c = client();

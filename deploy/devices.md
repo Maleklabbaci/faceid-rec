@@ -150,3 +150,56 @@ npm run test:kiosk          # 10 écrans rejoués en DOM : lien QR qui relie tou
                             # cases du code, QR dessiné, compte à rebours, renommage, révocation
 python3 -m pytest -q tests/test_relay.py   # le relais : jeton 600, en-têtes, messages d'erreur
 ```
+
+## Le poste doit tourner sans personne : caméra toujours autorisée, mode automatique toujours actif
+
+C'est le contrat de `site/kiosk.html` (et du poste live de l'espace, `#access`) : personne n'appuie
+sur « Activer la caméra », et rien ne s'éteint si quelqu'un touche à un bouton.
+
+Ce que le poste fait déjà, seul :
+
+1. **ouverture automatique** de la caméra dès la page chargée (et à chaque retour d'onglet ou de
+   veille), sans attendre un clic ;
+2. **mode automatique activé par défaut** et mémorisé : la case n'est jamais décochée par le poste
+   lui-même, et un `rec-auto` décoché à la main est réarmé par le veilleur ;
+3. **backoff** sur un refus : `NotAllowedError` / `NotReadableError` / `NotFoundError` → la raison est
+   écrite sur l'image, un nouvel essai est programmé (1,2 s → 2,4 s → 4,8 s → 9,6 s → 20 s maximum),
+   et une fiche « caméra » l'accompagne — une seule fois, pas une pile ;
+4. **surveillance du matériel** : une `MediaStreamTrack` qui meurt (câble débranché, caméra reprise
+   par une autre application) déclenche une réouverture 1,5 s plus tard ; un veilleur toutes les
+   10 s vérifie que l'image coule vraiment (`videoWidth`, `readyState`, `paused`) et rallume ;
+5. **pause = une minute** : le bouton « Mettre en pause » arrête le flux, annonce la reprise, et la
+   programmation tient même si la page est rechargée pendant la minute ;
+6. **écran qui reste allumé** : `navigator.wakeLock` est demandé (et redemandé au retour d'onglet) —
+   une borne endormie ne reconnaît plus personne, c'est le premier incident réel de ce produit ;
+7. **journalisation locale** : si le réseau tombe, le poste continue de mesurer les visages et le
+   kiosque le dit une fois par minute, sans inonder l'écran.
+
+Pour qu'aucun humain n'ait jamais à cliquer « Autoriser la caméra » :
+
+```bash
+# Chromium / Edge / Chrome OS — borne en mode kiosque, caméra et son préaccordés
+chromium --kiosk --autoplay-policy=no-user-gesture-required \
+         --use-fake-ui-for-media-stream \
+         --user-data-dir=/var/lib/faceid-kiosk \
+         --disable-session-crashed-bubble --no-first-run \
+         https://monsite.pages.dev/kiosk
+```
+
+- `--use-fake-ui-for-media-stream` accorde la caméra sans demander (à ne mettre que sur la borne de
+  l'entrée : c'est un lâcher-prise de permission, pas un réglage de navigation ordinaire) ;
+- `--autoplay-policy=no-user-gesture-required` laisse la voix et les sons sortir sans premier clic,
+  sinon la borne est muette jusqu'à ce que quelqu'un la touche ;
+- `--user-data-dir` isolé garde la permission et le jeton d'appareil (`localStorage`) entre les
+  redémarrages, et `--kiosk` enlève barre d'adresse et geste de fermeture ;
+- pas de `--use-fake-device-for-media-stream` en production : c'est une caméra fictive, utilisée par
+  les tests, pas par l'entrée du bâtiment.
+
+Firefox : accorder une fois la caméra (les permissions sont mémorisées par origine), puis régler
+`permissions.memory_only = false` et `media.autoplay.blocking_policy = 0`. Sur téléphone, « Ajouter à
+l'écran d'accueil » + autoriser la caméra une fois + écran toujours allumé ; le jeton est dans
+`localStorage`, la page `/kiosk` n'est jamais mise en cache, donc une révocabilité est immédiate.
+
+Côté serveur, rien de nouveau n'est nécessaire : la `Permissions-Policy` de `site/_headers` ouvre
+déjà `camera=(self)`, et l'option `--auto-accept` du navigateur ne change aucun réglage Cloudflare.
+

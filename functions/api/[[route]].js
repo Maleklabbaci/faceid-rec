@@ -404,28 +404,58 @@ async function logout(env, request) {
   return json({ ok: true, redirect: "/" }, 200, { "Set-Cookie": sessionCookie("", 0, cookieOptions(env, request)) });
 }
 
-async function state(env, user) {
+async function state(env, user, params = new URLSearchParams()) {
   const org = user.org_id;
   const sector = user.sectorConfig;
   const today = localParts(user.timezone).date;
-  const [membersRes, logsRes, countsRes, lateRes] = await env.DB.batch([
-    env.DB.prepare("SELECT id,name,email,subscription_end,consent_at IS NOT NULL AS enrolled FROM members WHERE org_id=? ORDER BY id DESC").bind(org),
-    env.DB.prepare(`SELECT entries.id, entries.method, entries.status, entries.local_date, entries.local_time, entries.late, entries.device_id, members.name,
-                           devices.name AS device_name
-                    FROM entries JOIN members ON members.id=entries.member_id
-                    LEFT JOIN devices ON devices.id=entries.device_id
-                    WHERE entries.org_id=? ORDER BY entries.id DESC LIMIT 30`).bind(org),
+  // Deux réglages de lecture pour l'interface : la fenêtre du graphique/période, et le pointeur
+  // du direct (« since ») qui ne renvoie que les passages parus depuis la dernière fois — c'est
+  // ce qui permet à l'espace de notifier une entrée fraîche sans rappeler tout le journal.
+  const days = Math.min(90, Math.max(1, Number(params.get("days")) || 7));
+  const since = Math.max(0, Number(params.get("since")) || 0);
+  const from = shiftDay(today, 1 - days);
+  const logsSql = `SELECT entries.id, entries.method, entries.status, entries.local_date, entries.local_time, entries.late, entries.device_id, members.name,
+                          devices.name AS device_name
+                   FROM entries JOIN members ON members.id=entries.member_id
+                   LEFT JOIN devices ON devices.id=entries.device_id
+                   WHERE entries.org_id=?${since ? " AND entries.id>?" : ""} ORDER BY entries.id DESC LIMIT ${since ? 200 : 30}`;
+  const logsStmt = env.DB.prepare(logsSql);
+  const [membersRes, logsRes, countsRes, lateRes, periodRes, devicesRes, headRes] = await env.DB.batch([
+    env.DB.prepare(`SELECT m.id, m.name, m.email, m.subscription_end, m.consent_at IS NOT NULL AS enrolled,
+                           (SELECT MAX(e.local_time) FROM entries e WHERE e.org_id=m.org_id AND e.member_id=m.id AND e.status='granted' AND e.local_date=?) AS last_today
+                    FROM members m WHERE m.org_id=? ORDER BY m.id DESC`).bind(today, org),
+    since ? logsStmt.bind(org, since) : logsStmt.bind(org),
     env.DB.prepare("SELECT status, COUNT(*) AS n, COUNT(DISTINCT member_id) AS people FROM entries WHERE org_id=? AND local_date=? GROUP BY status").bind(org, today),
     env.DB.prepare("SELECT COUNT(*) AS n FROM entries WHERE org_id=? AND local_date=? AND late=1").bind(org, today),
+    env.DB.prepare("SELECT local_date, status, COUNT(*) AS n, COUNT(DISTINCT member_id) AS people FROM entries WHERE org_id=? AND local_date>=? GROUP BY local_date, status").bind(org, from),
+    env.DB.prepare("SELECT id, name, last_seen_at, revoked_at FROM devices WHERE org_id=?").bind(org),
+    env.DB.prepare("SELECT MAX(id) AS head FROM entries WHERE org_id=?").bind(org),
   ]);
   const members = membersRes.results;
-  const logs = logsRes.results;
+  // La même phrase que celle du kiosque : l'écran de l'entreprise raconte le passage, il ne le
+  // numérote pas. Un refus reste sans message : c'est la règle de l'espace qui a protégé l'entrée,
+  // pas une panne du poste. C'est ce texte qui sert de corps à la notification ; le retard, lui,
+  // reste un badge (la colonne le dit mieux qu'une phrase répétée).
+  const logs = (logsRes.results || []).map((l) => ({ ...l, late: Boolean(l.late), message: l.status === "granted" ? entryMessage(sector, l.name, { local_time: l.local_time, late: false, late_minutes: 0 }) : "" }));
   const counts = Object.fromEntries(countsRes.results.map((r) => [r.status, r]));
   const active = members.filter((m) => m.subscription_end >= today).length;
   const entriesToday = counts.granted?.n || 0;
   const presentToday = counts.granted?.people || 0;
   const refusedToday = counts.refused?.n || 0;
   const lateToday = lateRes.results[0]?.n || 0;
+  const period = { from, to: today, days, granted: 0, refused: 0, people: 0, late: 0, byDay: {} };
+  for (const row of periodRes.results || []) {
+    period.byDay[row.local_date] = (period.byDay[row.local_date] || 0) + (row.status === "granted" ? row.n : 0);
+    if (row.status === "granted") { period.granted += row.n; period.people = Math.max(period.people, row.people); }
+    else period.refused += row.n;
+    if (row.status === "granted" && row.local_date === today) period.late = lateToday;
+  }
+  const deviceRows = devicesRes.results || [];
+  const now = Date.now();
+  const devicesInfo = {
+    count: deviceRows.filter((d) => !d.revoked_at).length,
+    online: deviceRows.filter((d) => d.last_seen_at && now - Date.parse(d.last_seen_at) < 120000).length,
+  };
   let kpis;
   if (sector.rule === "attendance") kpis = [["Employés", members.length, ""], ["Présents aujourd'hui", presentToday, "ok"], ["Absents", Math.max(active - presentToday, 0), "warn"], ["Retards aujourd'hui", lateToday, "warn"], ["Pointages aujourd'hui", entriesToday, ""]];
   else if (sector.rule === "one_per_day") kpis = [["Inscrits", members.length, ""], ["Repas servis aujourd'hui", entriesToday, "ok"], ["Inscriptions actives", active, ""], ["Expirées", members.length - active, "warn"], ["Refus aujourd'hui", refusedToday, "warn"]];
@@ -440,14 +470,13 @@ async function state(env, user) {
       .map((m) => ({ name: m.name, arrival: first[m.id]?.arrival || null, late: Boolean(first[m.id]?.late) }))
       .sort((a, b) => (a.arrival === null) - (b.arrival === null) || (a.arrival || "").localeCompare(b.arrival || "") || a.name.localeCompare(b.name));
   }
-  const days = Array.from({ length: 7 }, (_, i) => shiftDay(today, i - 6));
-  const { results: perDay } = await env.DB.prepare("SELECT local_date, COUNT(*) AS n FROM entries WHERE org_id=? AND status='granted' AND local_date>=? GROUP BY local_date").bind(org, days[0]).all();
-  const byDay = Object.fromEntries(perDay.map((r) => [r.local_date, r.n]));
-  const chart = days.map((d) => ({ day: d.slice(5), count: byDay[d] || 0 }));
+  const chartDays = Array.from({ length: days }, (_, i) => shiftDay(today, i - (days - 1)));
+  const chart = chartDays.map((d) => ({ day: d.slice(5), count: period.byDay[d] || 0 }));
   return json({
     user: { email: user.email },
     org: { name: user.org_name, sector: user.sector, timezone: user.timezone, work_start: user.work_start, late_tolerance: user.late_tolerance },
     sector, sectors: SECTORS, timezones: TIMEZONES, today, members, logs, kpis, attendance, chart,
+    period, devices: devicesInfo, head: headRes.results[0]?.head || 0, since,
   });
 }
 
@@ -500,6 +529,25 @@ async function enroll(env, user, member, request) {
 async function revoke(env, user, member) {
   await env.DB.prepare("UPDATE members SET descriptor=NULL, consent_at=NULL WHERE id=? AND org_id=?").bind(member.id, user.org_id).run();
   return json({ ok: true, message: "Données biométriques effacées." });
+}
+
+/**
+ * Journal filtré par période, sans le reste de l'état : c'est ce que l'interface télécharge quand
+ * on clique sur « Exporter en CSV » (et ce qu'un client tiers peut lire pour son propre tableur).
+ */
+async function journal(env, user, params) {
+  const days = Math.min(365, Math.max(1, Number(params.get("days")) || 30));
+  const today = localParts(user.timezone).date;
+  const from = shiftDay(today, 1 - days);
+  const { results } = await env.DB.prepare(
+    `SELECT entries.id, entries.member_id, members.name, members.email, entries.method, entries.status,
+            entries.local_date, entries.local_time, entries.late, devices.name AS device_name
+     FROM entries JOIN members ON members.id=entries.member_id
+     LEFT JOIN devices ON devices.id=entries.device_id
+     WHERE entries.org_id=? AND entries.local_date>=?
+     ORDER BY entries.local_date DESC, entries.id DESC LIMIT 5000`
+  ).bind(user.org_id, from).all();
+  return json({ ok: true, from, to: today, days, count: results.length, rows: results.map((r) => ({ ...r, late: Boolean(r.late) })) });
 }
 
 async function descriptors(env, user) {
@@ -767,8 +815,9 @@ export async function onRequest(context) {
     if (!user) fail(401, "Connexion requise.");
     if (method !== "GET") assertSameOrigin(request);
 
-    if (path === "state" && method === "GET") return await state(env, user);
+    if (path === "state" && method === "GET") return await state(env, user, url.searchParams);
     if (path === "descriptors" && method === "GET") return await descriptors(env, user);
+    if (path === "journal" && method === "GET") return await journal(env, user, url.searchParams);
     if (path === "members" && method === "POST") return await addMember(env, user, request);
     if (path === "recognized" && method === "POST") return await recognized(env, user, request);
     if (path === "settings" && method === "POST") return await settings(env, user, request);
@@ -776,6 +825,10 @@ export async function onRequest(context) {
     if (path === "devices" && method === "GET") return await devices(env, user);
     if (path === "devices/pairing" && method === "POST") return await createPairing(env, user, request);
     if (path === "devices/pairing/cancel" && method === "POST") return await cancelPairing(env, user, request);
+    if (path === "devices/revoke-all" && method === "POST") {
+      const done = await env.DB.prepare("UPDATE devices SET revoked_at=? WHERE org_id=? AND revoked_at IS NULL").bind(new Date().toISOString(), user.org_id).run();
+      return json({ ok: true, revoked: done.meta.changes || 0, message: done.meta.changes ? `${done.meta.changes} kiosque(s) déconnecté(s) : plus aucun jeton de votre espace ne fonctionne.` : "Aucun appareil à déconnecter." });
+    }
     const dev = path.match(/^devices\/(\d+)\/(revoke|rename)$/);
     if (dev && method === "POST") return await updateDevice(env, user, Number(dev[1]), request, dev[2]);
 

@@ -106,8 +106,8 @@ politique de sécurité stricte de la plateforme bloque).
 ```bash
 npm install                       # installe wrangler (outil Cloudflare)
 npm run dev                       # http://localhost:8788 avec une base D1 locale
-npm test                          # 10 tests de bout en bout de l'API (démarre un serveur local)
-npm run test:ui                   # 14 tests « navigateur » : login, inscription, app, kiosque
+npm test                          # 17 tests de bout en bout de l'API (démarre un serveur local)
+npm run test:ui                   # 18 tests « navigateur » : login, inscription, app, poste live, notifications
 ```
 
 - Chaque `git push` sur `main` redéploie la production (≈ 30 s).

@@ -208,8 +208,13 @@ export async function openPage(path, jar, { base = env.BASE, faceState } = {}) {
   }
   const flush = async (rounds = 12, ms = 40) => { for (let i = 0; i < rounds; i++) await new Promise((r) => setTimeout(r, ms)); };
   await flush();
-  // A kiosk page schedules its next scan; without this the timer chain outlives the test file.
-  const close = () => { try { window.close(); } catch (_) { /* already torn down */ } };
+  // A live page chains its own timers (camera retries, the direct feed, a watchdog): each link is
+  // created after an `await`, so jsdom's close() alone cannot stop it — the pending promise still
+  // runs and schedules one more timer, forever. A closed window must not be able to schedule work.
+  const close = () => {
+    try { window.setTimeout = () => 0; window.setInterval = () => 0; } catch (_) { /* sealed realm */ }
+    try { window.close(); } catch (_) { /* already torn down */ }
+  };
   return { window, dom, document: window.document, calls, navigations, errors, inlineStyles, state, flush, close };
 }
 

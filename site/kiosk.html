@@ -40,14 +40,14 @@
       <div class="kiosk-video">
         <video id="rec-video" autoplay playsinline muted></video>
         <div id="rec-banner" class="banner banner-idle" role="status" aria-live="assertive">
-          <strong id="rec-banner-title">Caméra inactive</strong>
-          <span id="rec-banner-text">Cliquez sur « Activer la caméra » pour démarrer ce kiosque.</span>
+          <strong id="rec-banner-title">Activation de la caméra…</strong>
+          <span id="rec-banner-text">Ce kiosque démarre seul ; il réessaiera tant que la caméra n'est pas ouverte.</span>
         </div>
       </div>
       <div class="kiosk-controls">
-        <button class="btn btn-primary btn-lg" type="button" id="rec-start">Activer la caméra</button>
+        <button class="btn btn-primary btn-lg" type="button" id="rec-start">Mettre en pause</button>
         <button class="btn btn-ghost" type="button" id="rec-check" disabled>Vérifier maintenant</button>
-        <label class="switch"><input type="checkbox" id="rec-auto" disabled> Mode automatique</label>
+        <label class="switch"><input type="checkbox" id="rec-auto"> Mode automatique (toujours actif)</label>
       </div>
       <p id="rec-status" class="status" aria-live="polite"></p>
       <div class="kiosk-counters">
@@ -69,6 +69,7 @@
 
 <script src="/vendor/face-api.js" defer></script>
 <script src="/assets/face.js" defer></script>
+<script src="/assets/toast.js" defer></script>
 <script src="/assets/kiosk.js" defer></script>
 </body>
 </html>

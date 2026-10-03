@@ -148,10 +148,51 @@ test("le kiosque reconnaît, annonce et journalise — sans jamais sortir de son
   assert.equal(logs[0].name, name, "le nom de la personne reconnue");
   assert.equal(logs[0].device_name, "Borne hall", "l'humain au comptoir voit d'où vient le passage");
   assert.equal(logs[0].method, "Facial");
+  // « Couper la caméra » reste possible, mais ne doit plus jamais laisser une borne éteinte.
   doc.getElementById("rec-start").click();
   await ctx.flush(6, 30);
-  assert.match(doc.getElementById("rec-start").textContent, /Activer la caméra/, "le bouton sert aussi à éteindre la caméra du kiosque");
-  assert.match(doc.getElementById("rec-banner-title").textContent, /Caméra inactive/);
+  assert.match(doc.getElementById("rec-start").textContent, /Reprendre/, "le bouton devient une reprise, pas un interrupteur qu'on oublie");
+  assert.match(doc.getElementById("rec-banner-text").textContent, /reprendra tout seul/i, "la pause est annoncée comme temporaire");
+  assert.equal(doc.getElementById("rec-check").disabled, true, "pendant la pause, le kiosque ne vérifie plus rien");
+  doc.getElementById("rec-start").click();  // reprise immédiate
+  await ctx.flush(12, 40);
+  assert.equal(doc.getElementById("rec-check").disabled, false, "et il repart sans qu'on reconfigure quoi que ce soit");
+  assert.match(doc.getElementById("rec-banner-title").textContent, /En attente d'un visage|ACCÈS AUTORISÉ/, "le direct a repris, verdict compris");
+  assert.equal(ctx.errors.length, 0, "pause et reprise sont propres : " + ctx.errors.join(" | "));
+  await stopKiosk(ctx);
+});
+
+test("un kiosque dont la caméra est refusée finit par s'allumer tout seul", async () => {
+  const { jar } = await space("canteen");
+  const code = await mintCode(jar, { name: "Borne cuisine" });
+  const ctx = track(await openPage("/kiosk?pair=" + code, makeJar(), { faceState: { loads: 0, faces: [], box: { x: 0, y: 0, width: 300, height: 400 } } }));
+  await ctx.flush(8, 30);
+  const doc = ctx.document;
+  const cam = ctx.window.navigator.mediaDevices;
+  const working = cam.getUserMedia;
+  // une caméra tenue par une autre application, comme sur un poste d'accueil mal réveillé
+  cam.getUserMedia = async () => { throw Object.assign(new Error("busy"), { name: "NotReadableError" }); };
+  doc.getElementById("rec-start").click();     // pause
+  await ctx.flush(3, 20);
+  doc.getElementById("rec-start").click();     // reprise -> échec -> veilleur
+  await ctx.flush(8, 30);
+  assert.match(doc.getElementById("rec-banner-text").textContent, /caméra/i, "le refus est dit en clair, sans écran bloqué");
+  assert.ok(doc.querySelectorAll('.toasts [data-tag="camera"]').length === 1, "une fiche prévenue — une seule fois, pas une ligne noyée dans le texte");
+  assert.equal(doc.getElementById("rec-check").disabled, true, "tant que la caméra est fermée, on ne vérifie rien");
+  await ctx.flush(40, 100);   // le veilleur passe à l'essai suivant, avec son compte à rebours
+  assert.match(doc.getElementById("rec-banner-text").textContent, /essai dans/i, "et il annonce qu'il réessaie seul");
+  // le poste se libère : personne ne reconfigure le kiosque, il se remet en marche lui-même.
+  const force = [...doc.querySelectorAll('.toasts [data-tag="camera"] button')].find((b) => /R\u00e9essayer/.test(b.textContent));
+  assert.ok(force, "la fiche propose de forcer le prochain essai");
+  cam.getUserMedia = working;
+  force.click();
+  await ctx.flush(20, 40);
+  assert.equal(doc.getElementById("rec-check").disabled, false, "le kiosque s'est rallumé tout seul");
+  assert.match(doc.getElementById("rec-status").textContent, /visage/i, "et le poste dit où il en est, sans qu'on rouvre quoi que ce soit");
+  assert.ok(doc.getElementById("rec-auto").checked, "et le mode automatique est reparti avec lui");
+  assert.equal(ctx.errors.length, 0, "la convalescence est silencieuse côté console : " + ctx.errors.join(" | "));
+  ctx.close();
+  opened.splice(opened.indexOf(ctx), 1);   // déjà fermé : after() ne doit pas y revenir
 });
 
 test("un visage inconnu du kiosque est refusé et annoncé", async () => {
