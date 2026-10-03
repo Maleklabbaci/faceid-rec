@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}{{ "Créer mon espace" if signup else "Connexion" }} — FaceID Platform{% endblock %}
+{% block body_class %}auth{% endblock %}
+{% block body %}
+<main class="auth-wrap">
+  <a class="brand" href="{{ url_for('index') }}"><span class="logo">F</span> FaceID Platform</a>
+  <section class="card auth-card">
+    <h1>{{ "Créer l'espace de votre entreprise" if signup else "Connexion à votre espace" }}</h1>
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% for category, message in messages %}
+        <p class="flash flash-{{ category }}">{{ message }}</p>
+      {% endfor %}
+    {% endwith %}
+    <form method="post" action="{{ url_for('signup' if signup else 'login') }}">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      {% if signup %}
+        <label>Nom de l'entreprise
+          <input name="company" required maxlength="100" placeholder="Ex. : Salle Olympia">
+        </label>
+        <label>Secteur d'activité
+          <select name="sector" required>
+            {% for key, label in sectors.items() %}
+              <option value="{{ key }}">{{ label }}</option>
+            {% endfor %}
+          </select>
+        </label>
+      {% endif %}
+      <label>Email professionnel
+        <input type="email" name="email" required maxlength="254" autocomplete="username">
+      </label>
+      <label>Mot de passe {% if signup %}<span class="muted small">(12 caractères minimum)</span>{% endif %}
+        <input type="password" name="password" required minlength="{{ 12 if signup else 1 }}" maxlength="256" autocomplete="{{ 'new-password' if signup else 'current-password' }}">
+      </label>
+      <button class="btn btn-primary btn-block" type="submit">{{ "Créer mon espace" if signup else "Se connecter" }}</button>
+    </form>
+    <p class="muted small">
+      {% if signup %}
+        Déjà un compte ? <a href="{{ url_for('login') }}">Se connecter</a>
+      {% else %}
+        Pas encore d'espace ? <a href="{{ url_for('signup') }}">Créer un compte</a>
+      {% endif %}
+    </p>
+  </section>
+</main>
+{% endblock %}

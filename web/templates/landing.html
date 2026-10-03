@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block title %}FaceID Platform — Contrôle d'accès par abonnement, pour tous les secteurs{% endblock %}
+{% block body_class %}landing{% endblock %}
+{% block body %}
+<header class="topbar">
+  <a class="brand" href="{{ url_for('index') }}"><span class="logo">F</span> FaceID Platform</a>
+  <nav>
+    {% if user %}
+      <a class="btn btn-primary" href="{{ url_for('dashboard') }}">Ouvrir mon espace</a>
+    {% else %}
+      <a class="btn btn-ghost" href="{{ url_for('login') }}">Connexion</a>
+      <a class="btn btn-primary" href="{{ url_for('signup') }}">Essai gratuit</a>
+    {% endif %}
+  </nav>
+</header>
+
+<section class="hero">
+  <p class="eyebrow">Plateforme SaaS multi-entreprises</p>
+  <h1>Le contrôle d'accès par abonnement,<br>prêt pour votre secteur.</h1>
+  <p class="lead">Gérez vos membres, vos abonnements et vos entrées depuis un simple navigateur. Chaque entreprise dispose de son espace isolé et sécurisé.</p>
+  <div class="hero-actions">
+    <a class="btn btn-primary btn-lg" href="{{ url_for('signup') }}">Créer mon espace</a>
+    <a class="btn btn-ghost btn-lg" href="#secteurs">Voir les secteurs</a>
+  </div>
+</section>
+
+<section id="secteurs" class="sectors">
+  <h2>Une seule plateforme, plusieurs métiers</h2>
+  <div class="grid">
+    <article class="card"><h3>🏋️ Sport & fitness</h3><p>Salles de sport, piscines, clubs : abonnements mensuels, accès aux heures d'ouverture, relances d'expiration.</p></article>
+    <article class="card"><h3>🎓 Éducation</h3><p>Écoles privées, centres de formation : présence des élèves et des formateurs, cartes d'accès remplacées par le visage.</p></article>
+    <article class="card"><h3>💼 Coworking</h3><p>Espaces partagés : forfaits journaliers ou mensuels, accès des membres et de leurs invités.</p></article>
+    <article class="card"><h3>🏢 Entreprises</h3><p>Bureaux, entrepôts : badge virtuel pour les employés et prestataires, journal des entrées.</p></article>
+    <article class="card"><h3>🎮 Loisirs</h3><p>Salles de jeux, clubs privés : contrôle de l'abonnement à l'entrée, en quelques secondes.</p></article>
+  </div>
+</section>
+
+<section class="features">
+  <h2>Ce que vous obtenez</h2>
+  <div class="grid">
+    <article class="card"><h3>Espace privé par entreprise</h3><p>Vos données ne sont jamais mêlées à celles d'une autre société. Chaque compte ne voit que son propre espace.</p></article>
+    <article class="card"><h3>Abonnements & renouvellements</h3><p>Dates de fin, statut actif/expiré, renouvellement en un clic, historique des passages.</p></article>
+    <article class="card"><h3>Reconnaissance faciale en option</h3><p>Activée uniquement avec le consentement explicite de la personne, effaçable à tout moment.</p></article>
+    <article class="card"><h3>Tableau de bord</h3><p>Membres actifs, passages du jour, tendance sur 7 jours : l'essentiel pour piloter votre activité.</p></article>
+  </div>
+</section>
+
+<section class="pricing">
+  <h2>Tarifs indicatifs</h2>
+  <div class="grid">
+    <article class="card plan"><h3>Starter</h3><p class="price">Gratuit</p><ul><li>Jusqu'à 25 membres</li><li>Gestion manuelle des entrées</li><li>1 administrateur</li></ul><a class="btn btn-ghost" href="{{ url_for('signup') }}">Commencer</a></article>
+    <article class="card plan highlight"><h3>Pro</h3><p class="price">À définir</p><ul><li>Membres illimités</li><li>Reconnaissance faciale</li><li>Historique complet</li></ul><a class="btn btn-primary" href="{{ url_for('signup') }}">Essayer</a></article>
+    <article class="card plan"><h3>Entreprise</h3><p class="price">Sur devis</p><ul><li>Plusieurs sites</li><li>Intégration porte / tourniquet</li><li>Support dédié</li></ul><a class="btn btn-ghost" href="{{ url_for('signup') }}">Nous contacter</a></article>
+  </div>
+  <p class="muted small">Le paiement en ligne n'est pas encore activé : les tarifs sont présentés à titre indicatif.</p>
+</section>
+
+<footer class="footer">
+  <p>© FaceID Platform — Données biométriques traitées uniquement avec consentement, supprimables à tout moment.</p>
+</footer>
+{% endblock %}
