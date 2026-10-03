@@ -100,7 +100,7 @@ L'URL s'affiche dans le terminal 2. Elle change à chaque lancement et n'est pas
 | `WEB_DATABASE` | Fichier SQLite (la clé de session générée est stockée à côté) | sur un disque persistant |
 | `TRUST_PROXY` | `1` derrière Cloudflare/Nginx : vraie IP client (`CF-Connecting-IP`) pour la limitation de tentatives, schéma HTTPS | `1` |
 | `PRELOAD_FACE` | `1` : charge le moteur facial au démarrage (partagé entre workers gunicorn) | `1` |
-| `COOKIE_SECURE` | `0` seulement pour un test en HTTP local | ne pas définir |
+| `COOKIE_SECURE` | `0` ou `1` pour forcer (inutile : par défaut le cookie suit le schéma de la requête) | ne pas définir |
 | `EMBED_PREVIEW` | `1` seulement pour l'aperçu intégré dans une iframe | ne pas définir |
 | `WEB_CONCURRENCY` | Nombre de workers gunicorn | 2 (1 si 1 Go de RAM) |
 

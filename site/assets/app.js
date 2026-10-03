@@ -180,8 +180,11 @@
         : '<p class="muted">Ajoutez vos employés pour suivre les présences.</p>';
       html += "</section>";
     }
+    // The bar height travels as data-height: the page is served with `style-src 'self'`
+    // (no 'unsafe-inline'), so a style="…" attribute written into the markup is refused by
+    // the browser and every bar collapses to its min-height. Heights are applied from JS below.
     html += `<section class="card"><h2>${esc(s.entries)} sur 7 jours</h2><div class="chart">` +
-      S.chart.map((c) => `<div class="bar-wrap"><div class="bar" style="height: ${Math.round((c.count / max) * 100)}%"><span>${c.count}</span></div><small>${esc(c.day)}</small></div>`).join("") + "</div></section>";
+      S.chart.map((c) => `<div class="bar-wrap"><div class="bar" data-height="${Math.round((c.count / max) * 100)}"><span>${c.count}</span></div><small>${esc(c.day)}</small></div>`).join("") + "</div></section>";
     html += `<section class="card"><h2>Derniers ${esc(s.entries.toLowerCase())}</h2>${journal(S.logs.slice(0, 10))}</section>`;
     return html;
   }
@@ -283,6 +286,21 @@
       </section>`;
   }
 
+  // CSP-safe chart sizing: writing `style="…"` into markup is refused by `style-src 'self'`,
+  // but assigning a property on el.style is allowed. Same result, no 'unsafe-inline' needed.
+  function applyBarHeights(root) {
+    root.querySelectorAll(".bar[data-height]").forEach((bar) => { bar.style.height = Number(bar.dataset.height) + "%"; });
+  }
+
+  // Date math on the org's own calendar day. `new Date()` + toISOString() slides back one day
+  // for every timezone east of UTC (Algeria included), which turned « Journée » into « yesterday »
+  // and made a brand-new member expire on arrival; it also jumped to March 3rd after January 31st.
+  function addPeriod(base, { days = 0, months = 0 }) {
+    const [y, m, d] = String(base).split("-").map(Number);
+    const lastDayOfMonth = new Date(Date.UTC(y, m + months, 0)).getUTCDate();
+    return new Date(Date.UTC(y, m - 1 + months, Math.min(d, lastDayOfMonth) + days)).toISOString().slice(0, 10);
+  }
+
   const pageEl = document.getElementById("page");
   function render() {
     sector = S.org.sector;
@@ -302,6 +320,7 @@
     }
     kiosk.unmount();
     pageEl.innerHTML = { overview: renderOverview, members: renderMembers, access: renderAccess, settings: renderSettings }[page]();
+    applyBarHeights(pageEl);
     refreshVoiceInfo();
     if (page === "access") kiosk.mount();
     if (page === "members" && pendingCapture) {
@@ -340,10 +359,7 @@
     const chip = event.target.closest(".chip");
     if (chip) {
       const input = document.getElementById(chip.closest(".quick-dates").dataset.target);
-      const d = new Date();
-      if (chip.dataset.months) d.setMonth(d.getMonth() + Number(chip.dataset.months));
-      if (chip.dataset.days) d.setDate(d.getDate() + Number(chip.dataset.days));
-      input.value = d.toISOString().slice(0, 10);
+      input.value = addPeriod(S.today, { days: Number(chip.dataset.days || 0), months: Number(chip.dataset.months || 0) });
       return;
     }
     if (event.target.closest(".js-voice-toggle")) { toggleVoice(); return; }

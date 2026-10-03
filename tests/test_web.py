@@ -359,3 +359,87 @@ def test_database_dir_holds_session_key(tmp_path, monkeypatch):
     second = create_app({"SESSION_COOKIE_SECURE": False, "TESTING": True})
     assert (tmp_path / "vol" / "session.key").exists() and (tmp_path / "vol" / "web.db").exists()
     assert first.secret_key == second.secret_key  # stable across restarts, stored on the persistent volume
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for the fixes that the DOM suite proved on the Cloudflare edition:
+# the same product, the same rules, this time on Flask.
+
+
+def test_session_cookie_is_secure_only_where_the_browser_accepts_it(tmp_path):
+    """A Secure cookie outside HTTPS is dropped by the browser: signup would answer 200 and
+    /app would bounce back to /login forever on a plain-HTTP kiosk."""
+    app = create_app({"DATABASE": str(tmp_path / "cookie.db"), "TESTING": True})  # COOKIE_SECURE=auto
+    lan = app.test_client()
+    token = re.search(r'name="csrf" value="([0-9a-f]+)"', lan.get("/signup", base_url="http://192.168.1.20").get_data(as_text=True)).group(1)
+    plain = lan.post("/signup", data={"csrf": token, "company": "Kiosque LAN", "email": "lan@kiosque.dz", "password": "motdepasse-lan-123", "sector": "canteen"}, base_url="http://192.168.1.20")
+    assert plain.status_code == 302
+    assert "Secure" not in plain.headers.get("Set-Cookie", ""), "plain HTTP must not ask for a Secure cookie"
+    assert lan.get("/app", base_url="http://192.168.1.20").status_code == 200, "…and that session must actually work"
+
+    tls = app.test_client()
+    token = re.search(r'name="csrf" value="([0-9a-f]+)"', tls.get("/signup", base_url="https://faceid.example").get_data(as_text=True)).group(1)
+    secure = tls.post("/signup", data={"csrf": token, "company": "Salle TLS", "email": "tls@faceid.example", "password": "motdepasse-tls-1234", "sector": "fitness"}, base_url="https://faceid.example")
+    assert secure.status_code == 302
+    assert "Secure" in secure.headers.get("Set-Cookie", ""), "HTTPS keeps the Secure flag"
+
+
+def test_signup_validation_does_not_burn_the_hourly_budget(tmp_path):
+    """Two typos in the form must not lock a legitimate customer out of the signup page."""
+    app = create_app({"DATABASE": str(tmp_path / "budget.db"), "SESSION_COOKIE_SECURE": False, "TESTING": True, "TRUST_PROXY": True})
+    client = app.test_client()
+    token = csrf_of(client, "/signup")
+    ip = {"CF-Connecting-IP": "203.0.113.77"}
+    for i in range(4):
+        r = client.post("/signup", data={"csrf": token, "company": "Trop court", "email": f"oops{i}@x.dz", "password": "court", "sector": "fitness"}, headers=ip)
+        assert "12 à 256 caractères" in r.get_data(as_text=True)
+    ok = client.post("/signup", data={"csrf": token, "company": "Salle Après", "email": "apres@x.dz", "password": "motdepasse-apres-12", "sector": "fitness"}, headers=ip)
+    assert ok.status_code == 302, "the valid attempt still gets through"
+
+
+def test_colleagues_behind_one_ip_are_not_locked_out_of_login(tmp_path):
+    app = create_app({"DATABASE": str(tmp_path / "office.db"), "SESSION_COOKIE_SECURE": False, "TESTING": True, "TRUST_PROXY": True})
+    client = app.test_client()
+    token = csrf_of(client)
+    ip = {"CF-Connecting-IP": "203.0.113.78"}
+    for i in range(12):  # a whole office sharing one NAT address
+        r = client.post("/login", data={"csrf": token, "email": f"collegue{i}@x.dz", "password": "mauvais"}, headers=ip)
+        assert r.status_code == 200 and "incorrect" in r.get_data(as_text=True), f"colleague {i} was locked out"
+    # an account being guessed from that address is still throttled
+    for _ in range(10):
+        client.post("/login", data={"csrf": token, "email": "victime@x.dz", "password": "mauvais"}, headers=ip)
+    assert client.post("/login", data={"csrf": token, "email": "victime@x.dz", "password": "mauvais"}, headers=ip).status_code == 429
+
+
+def test_dashboard_chart_survives_the_strict_csp(client):
+    """`style-src 'self'` refuses inline style attributes, so the bars must be sized by the script."""
+    signup(client, "chart@olympia.dz")
+    add_member(client, "Amine")
+    ids = member_ids(client)
+    csrf = csrf_of(client, "/app/members")
+    client.post(f"/members/{ids[0]}/entry", data={"csrf": csrf})
+    page = client.get("/app/overview")
+    body = page.get_data(as_text=True)
+    assert 'class="bar" data-height=' in body, "the bar height travels as a data attribute"
+    assert 'style="height' not in body, "no inline style attribute for the browser to refuse"
+    style_src = re.search(r"style-src([^;]*)", page.headers["Content-Security-Policy"]).group(1)
+    assert "'self'" in style_src and "unsafe-inline" not in style_src, "the policy stays strict, no relaxation needed"
+
+
+def test_cookie_secure_env_still_wins(tmp_path, monkeypatch):
+    """COOKIE_SECURE stays the documented override: "0" means off, "1" means on, whatever the scheme."""
+    monkeypatch.setenv("COOKIE_SECURE", "0")
+    off = create_app({"DATABASE": str(tmp_path / "off.db"), "TESTING": True})
+    client = off.test_client()
+    url = "https://faceid.example"
+    token = re.search(r'name="csrf" value="([0-9a-f]+)"', client.get("/signup", base_url=url).get_data(as_text=True)).group(1)
+    r = client.post("/signup", data={"csrf": token, "company": "Forcé HTTP", "email": "force@olympia.dz", "password": "motdepasse-force-12", "sector": "fitness"}, base_url=url)
+    assert r.status_code == 302 and "Secure" not in r.headers.get("Set-Cookie", ""), "COOKIE_SECURE=0 keeps working over HTTPS"
+
+    monkeypatch.setenv("COOKIE_SECURE", "1")
+    on = create_app({"DATABASE": str(tmp_path / "on.db"), "TESTING": True})
+    client = on.test_client()
+    url = "http://192.168.1.20"
+    token = re.search(r'name="csrf" value="([0-9a-f]+)"', client.get("/signup", base_url=url).get_data(as_text=True)).group(1)
+    r = client.post("/signup", data={"csrf": token, "company": "Forcé HTTPS", "email": "force2@olympia.dz", "password": "motdepasse-force-12", "sector": "fitness"}, base_url=url)
+    assert r.status_code == 302 and "Secure" in r.headers.get("Set-Cookie", ""), "COOKIE_SECURE=1 forces the flag"

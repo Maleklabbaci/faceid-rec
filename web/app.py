@@ -13,6 +13,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from flask import Flask, abort, flash, g, jsonify, make_response, redirect, render_template, request, session, url_for
+from flask.sessions import SecureCookieSessionInterface
 from PIL import Image, UnidentifiedImageError
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
@@ -50,6 +51,40 @@ MIGRATIONS = {
 }
 
 
+def cookie_secure_setting():
+    """COOKIE_SECURE=0|1 forces the flag; anything else follows the scheme of each request."""
+    raw = (os.environ.get("COOKIE_SECURE") or "").strip().lower()
+    if raw in ("", "auto"):
+        return "auto"
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"COOKIE_SECURE doit valoir 0, 1 ou auto (reçu : {raw!r})")
+
+
+class AdaptiveSessionInterface(SecureCookieSessionInterface):
+    """COOKIE_SECURE=auto (the default): never ask for a Secure cookie the browser cannot use.
+
+    A Secure flag is refused outside a secure context, which turned a successful login on a
+    plain-HTTP kiosk (http://192.168.1.20:5000) into an endless bounce back to /login.
+    """
+
+    def get_cookie_secure(self, app):
+        if app.config["ALLOW_EMBED"]:
+            return True  # SameSite=None is only honoured together with Secure
+        setting = app.config["SESSION_COOKIE_SECURE"]
+        if setting == "auto":
+            return bool(request.is_secure)
+        return bool(setting)
+
+    def get_cookie_samesite(self, app):
+        setting = app.config["SESSION_COOKIE_SAMESITE"] or "Lax"
+        if setting == "None" and not self.get_cookie_secure(app):
+            return "Lax"  # without Secure the browser would drop the cookie altogether
+        return setting
+
+
 def tz_of(name):
     try:
         return ZoneInfo(name)
@@ -82,7 +117,8 @@ def create_app(config=None):
         MAX_CONTENT_LENGTH=3 * 1024 * 1024,
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="None" if embed else "Lax",
-        SESSION_COOKIE_SECURE=True if embed else os.environ.get("COOKIE_SECURE", "1") == "1",
+        # "auto" follows the scheme of each request; COOKIE_SECURE=1/0 forces it either way.
+        SESSION_COOKIE_SECURE=True if embed else cookie_secure_setting(),
         PERMANENT_SESSION_LIFETIME=timedelta(hours=8),
         ALLOW_EMBED=embed,
         # TRUST_PROXY=1 when running behind Cloudflare Tunnel / Nginx: real client IP and scheme
@@ -92,6 +128,7 @@ def create_app(config=None):
         app.config.update(config)
     if app.config["TRUST_PROXY"]:
         app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+    app.session_interface = AdaptiveSessionInterface()
     limits = defaultdict(deque)
     face_engine = {"available": None}
 
@@ -170,10 +207,13 @@ def create_app(config=None):
     def context():
         return {"csrf": session.get("csrf"), "user": g.user, "sectors": SECTORS, "s": g.sector, "timezones": TIMEZONES}
 
-    def limited(bucket, count, seconds=60):
+    def client_ip_address():
+        return (request.headers.get("CF-Connecting-IP") if app.config["TRUST_PROXY"] else None) or request.remote_addr
+
+    def limited(bucket, count, seconds=60, key=None):
         # Single-process MVP protection. Use shared Redis limits for production.
-        client_ip = (request.headers.get("CF-Connecting-IP") if app.config["TRUST_PROXY"] else None) or request.remote_addr
-        key = (bucket, g.user["id"] if g.user else client_ip)
+        # Without a key: one bucket per visitor (or per logged-in user).
+        key = key or (g.user["id"] if g.user else client_ip_address())
         now = time.monotonic()
         q = limits[key]
         while q and q[0] < now - seconds:
@@ -257,7 +297,6 @@ def create_app(config=None):
     @app.route("/signup", methods=["GET", "POST"])
     def signup():
         if request.method == "POST":
-            limited("signup", 5, 3600)
             name = request.form.get("company", "").strip()
             email = request.form.get("email", "").strip().lower()
             password = request.form.get("password", "")
@@ -265,6 +304,7 @@ def create_app(config=None):
             if not name or len(name) > 100 or "@" not in email or len(email) > 254 or len(password) < 12 or len(password) > 256 or sector not in SECTORS:
                 flash("Vérifiez les champs. Le mot de passe doit contenir 12 à 256 caractères.", "error")
             else:
+                limited("signup", 5 if request.headers.get("CF-Connecting-IP") else 60, 3600)
                 try:
                     org_id = db().execute("INSERT INTO organizations(name,sector) VALUES(?,?)", (name, sector)).lastrowid
                     uid = db().execute("INSERT INTO users(org_id,email,password) VALUES(?,?,?)", (org_id, email, generate_password_hash(password))).lastrowid
@@ -280,8 +320,14 @@ def create_app(config=None):
     @app.route("/login", methods=["GET", "POST"])
     def login():
         if request.method == "POST":
-            limited("login", 10, 300)
-            row = db().execute("SELECT * FROM users WHERE email=?", (request.form.get("email", "").strip().lower(),)).fetchone()
+            email = request.form.get("email", "").strip().lower()
+            visitor = client_ip_address() or ""
+            # Guessing one account is throttled per account *and* visitor, so colleagues sharing
+            # one NAT address cannot lock each other out; 10 logins in 5 minutes is nothing for a
+            # hundred employees on Monday morning. Spraying many accounts stays limited per visitor.
+            limited("login", 10 if request.headers.get("CF-Connecting-IP") else 100, 300, key=f"acct:{email}:{visitor}")
+            limited("login", 60 if request.headers.get("CF-Connecting-IP") else 600, 300, key=f"ip:{visitor}")
+            row = db().execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
             # Always do a password hash check to reduce account enumeration timing.
             fallback = generate_password_hash("not-a-real-password") if row is None else row["password"]
             if check_password_hash(fallback, request.form.get("password", "")) and row:

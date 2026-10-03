@@ -130,18 +130,28 @@
     });
   });
 
-  // Quick date chips ("Journée", "1 mois", ...)
+  // Quick date chips ("Journée", "1 mois", ...) — computed on the company's local calendar
+  // day: new Date().toISOString() slides back one day east of UTC, which turned « Journée »
+  // into yesterday and made a brand-new member expire on arrival.
+  function addPeriod(base, { days = 0, months = 0 }) {
+    const [y, m, d] = String(base).split("-").map(Number);
+    const lastDayOfMonth = new Date(Date.UTC(y, m + months, 0)).getUTCDate();
+    return new Date(Date.UTC(y, m - 1 + months, Math.min(d, lastDayOfMonth) + days)).toISOString().slice(0, 10);
+  }
   document.querySelectorAll(".quick-dates").forEach((group) => {
     const input = document.getElementById(group.dataset.target);
     group.querySelectorAll(".chip").forEach((chip) => {
       chip.addEventListener("click", () => {
-        const d = new Date();
-        if (chip.dataset.months) d.setMonth(d.getMonth() + Number(chip.dataset.months));
-        if (chip.dataset.days) d.setDate(d.getDate() + Number(chip.dataset.days));
-        input.value = d.toISOString().slice(0, 10);
+        const base = group.dataset.today || input.value || addPeriod(new Date().toISOString().slice(0, 10), {});
+        input.value = addPeriod(base, { days: Number(chip.dataset.days || 0), months: Number(chip.dataset.months || 0) });
       });
     });
   });
+
+  // CSP-safe chart sizing: the policy has `style-src 'self'` without 'unsafe-inline', so an
+  // inline style="…" attribute in the markup is refused and every bar collapses. Setting the
+  // height from the script is allowed and needs no relaxation of the policy.
+  document.querySelectorAll(".bar[data-height]").forEach((bar) => { bar.style.height = Number(bar.dataset.height) + "%"; });
 
   // ---- Camera helpers --------------------------------------------------
   function setStatus(el, text, kind) {

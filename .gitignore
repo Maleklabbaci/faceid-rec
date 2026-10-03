@@ -1,0 +1,30 @@
+# Environment / secrets — ne jamais committer .env (SECRET_KEY, token du tunnel)
+.env
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+# Flask instance folder: web.db + generated session.key (real user data!)
+instance/
+
+# Local app data (desktop edition)
+members.db
+photos/
+error.log
+installer_output/
+build/
+dist/
+*.spec.bak
+
+# Node / wrangler
+node_modules/
+.wrangler/
+.dev.vars
+
+# OS
+.DS_Store
+Thumbs.db

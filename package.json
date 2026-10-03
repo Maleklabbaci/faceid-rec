@@ -5,9 +5,12 @@
   "scripts": {
     "dev": "wrangler pages dev site --d1 DB=faceid --port 8788 --ip 0.0.0.0",
     "test": "node --test tests/cloudflare.test.mjs",
+    "test:ui": "node --test tests/ui-flow.test.mjs",
+    "test:all": "node --test tests/cloudflare.test.mjs tests/ui-flow.test.mjs",
     "deploy": "wrangler pages deploy site --project-name saaspromax"
   },
   "devDependencies": {
+    "jsdom": "^30.1.1",
     "wrangler": "^4.0.0"
   }
 }
