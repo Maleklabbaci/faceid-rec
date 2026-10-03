@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#080b16">
+  <meta name="robots" content="noindex">
+  <title>Kiosque — FaceID</title>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body class="kiosk-page sector-fitness" data-voice-base="/voice/">
+<header class="kiosk-top">
+  <a class="brand" href="/"><span class="logo">F</span> FaceID <span class="brand-sub">Kiosque</span></a>
+  <span class="badge" id="k-device">non relié</span>
+  <span class="muted small" id="k-org"></span>
+  <button class="btn btn-ghost btn-sm js-voice-toggle" type="button" id="k-voice" aria-pressed="true" title="Annonces vocales">🔊 Voix</button>
+  <button class="btn btn-ghost btn-sm" type="button" id="k-unpair" hidden>Quitter ce kiosque</button>
+</header>
+
+<main class="kiosk-main">
+  <div class="kiosk-stage">
+
+    <section class="kiosk-panel kiosk-view" id="view-pair">
+      <h1>Reliez cet appareil</h1>
+      <p>Saisissez le code affiché dans l'espace de l'entreprise — il est valable dix minutes et ne sert qu'une fois. Le kiosque ne saura que reconnaître un visage et journaliser un passage.</p>
+      <form id="pair-form" autocomplete="off">
+        <label for="k-code">Code d'appairage</label>
+        <input id="k-code" class="kiosk-code" name="code" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="80" placeholder="ABK7QD" aria-describedby="k-pair-error">
+        <p class="kiosk-error" id="k-pair-error" role="alert"></p>
+        <div class="kiosk-side">
+          <button class="btn btn-primary btn-lg" type="submit" id="k-pair-go">Relier cet appareil</button>
+          <span class="muted small" id="k-pair-hint" hidden>Le code du lien est en train d'être appliqué…</span>
+        </div>
+      </form>
+      <small class="muted js-voice-info"></small>
+      <p class="kiosk-help">Le code se génèse dans <a href="/app#devices">Espace entreprise → Appareils reliés</a>. Une caméra réseau ou un boîtier sans navigateur passe par le relais <code>tools/kiosk-relay.py</code> et le même code, échangé contre un jeton.</p>
+    </section>
+
+    <section class="kiosk-view" id="view-run" hidden>
+      <div class="kiosk-video">
+        <video id="rec-video" autoplay playsinline muted></video>
+        <div id="rec-banner" class="banner banner-idle" role="status" aria-live="assertive">
+          <strong id="rec-banner-title">Caméra inactive</strong>
+          <span id="rec-banner-text">Cliquez sur « Activer la caméra » pour démarrer ce kiosque.</span>
+        </div>
+      </div>
+      <div class="kiosk-controls">
+        <button class="btn btn-primary btn-lg" type="button" id="rec-start">Activer la caméra</button>
+        <button class="btn btn-ghost" type="button" id="rec-check" disabled>Vérifier maintenant</button>
+        <label class="switch"><input type="checkbox" id="rec-auto" disabled> Mode automatique</label>
+      </div>
+      <p id="rec-status" class="status" aria-live="polite"></p>
+      <div class="kiosk-counters">
+        <div class="stat"><span class="stat-label" id="k-count-label">Passages du jour</span><span class="stat-value" id="k-granted">0</span></div>
+        <div class="stat"><span class="stat-label">Personnes distinctes</span><span class="stat-value ok" id="k-people">0</span></div>
+        <div class="stat"><span class="stat-label">Refus</span><span class="stat-value warn" id="k-refused">0</span></div>
+      </div>
+      <ul id="rec-live" class="kiosk-log" aria-label="Derniers passages"></ul>
+    </section>
+
+  </div>
+</main>
+
+<footer class="kiosk-foot">
+  <span class="pulse idle" id="k-pulse"></span>
+  <span id="k-foot-note">Kiosque en attente d'appairage.</span>
+  <span class="muted" id="k-date"></span>
+</footer>
+
+<script src="/vendor/face-api.js" defer></script>
+<script src="/assets/face.js" defer></script>
+<script src="/assets/kiosk.js" defer></script>
+</body>
+</html>

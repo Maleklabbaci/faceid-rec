@@ -3,11 +3,15 @@
 
   const embedded = window.self !== window.top;
   const VOICE_BASE = document.body.dataset.voiceBase || "/voice/";
-  const PAGES = ["overview", "members", "access", "settings"];
+  const PAGES = ["overview", "members", "access", "devices", "settings"];
+  const DEVICE_KINDS = [["kiosk", "Kiosque d'entrée"], ["phone", "Téléphone"], ["tablet", "Tablette"], ["desk", "Poste d'accueil"], ["box", "Boîtier / caméra"]];
   const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
 
   let S = null; // server state (/api/state)
+  let D = null; // linked devices (/api/devices), loaded on demand
+  let pendingPair = null; // the pairing code just minted, until it is used or expires
+  let countdownTimer = null; // one 1-second chain paints every remaining-time cell of the board
   let page = PAGES.includes(location.hash.slice(1)) ? location.hash.slice(1) : "overview";
   let sector = "fitness";
   let pendingCapture = null; // member id to enroll right after creation
@@ -171,7 +175,10 @@
   function renderOverview() {
     const s = sec();
     const max = Math.max(1, ...S.chart.map((c) => c.count));
-    let html = `<h1>Tableau de bord <span class="muted small">— ${esc(s.label)}</span></h1><div class="stats">` +
+    const next = s.rule === "attendance"
+      ? { href: "#access", label: "Voir les présences du jour" }
+      : { href: "#members", label: "Ajouter un·e " + s.person };
+    let html = `<div class="page-head"><h1>Tableau de bord</h1><span class="muted small">${esc(s.label)} · journée du ${esc(S.today)}</span><a class="btn btn-ghost btn-sm" href="${next.href}">${esc(next.label)}</a></div><div class="stats">` +
       S.kpis.map(([label, value, tone]) => `<div class="stat"><span class="stat-label">${esc(label)}</span><span class="stat-value ${tone}">${esc(value)}</span></div>`).join("") + "</div>";
     if (s.rule === "attendance") {
       html += `<section class="card"><h2>Présences du jour <span class="muted small">— début ${esc(S.org.work_start)}, tolérance ${esc(S.org.late_tolerance)} min</span></h2>`;
@@ -191,7 +198,8 @@
 
   function renderMembers() {
     const s = sec();
-    let html = `<h1>${esc(cap(s.people))}</h1>
+    const active = S.members.filter((m) => m.subscription_end >= S.today).length;
+    let html = `<div class="page-head"><h1>${esc(cap(s.people))}</h1><span class="muted small">${S.members.length} ${esc(s.people)}, ${active} avec ${esc(s.access).toLowerCase()} actif(ve)</span></div>
       <section class="card"><h2>Ajouter un ${esc(s.person)}</h2>
         <p class="muted small">Tapez le nom, cliquez sur « Ajouter et capturer » : la personne regarde la caméra une seconde, c'est enregistré.</p>
         <form class="inline-form" data-api="/api/members" id="add-member-form">
@@ -234,7 +242,7 @@
   function renderAccess() {
     const s = sec();
     const rule = s.rule === "attendance" ? "le pointage est horodaté et les retards calculés" : s.rule === "one_per_day" ? "un seul repas par personne et par jour" : "l'accès est contrôlé selon la date payée";
-    return `<h1>${s.rule === "attendance" ? "Pointage" : "Contrôle d'accès"}</h1>
+    return `<div class="page-head"><h1>${s.rule === "attendance" ? "Pointage" : "Contrôle d'accès"}</h1><span class="muted small">Ce poste-ci sert de kiosque ; un téléphone ou une caméra peuvent en faire un autre.</span><a class="btn btn-ghost btn-sm" href="#devices">Relier un appareil</a></div>
       <div class="two-cols">
         <section class="card kiosk"><h2>Reconnaissance faciale</h2>
           <p class="muted small">Activez la caméra puis le mode automatique : chaque visage est analysé dans ce navigateur (aucune image envoyée), ${rule}. Aucune porte n'est actionnée depuis le navigateur (boîtier sur site à venir).</p>
@@ -255,9 +263,152 @@
       <section class="card"><h2>Journal des ${esc(s.entries.toLowerCase())}</h2><div id="access-journal">${journal(S.logs)}</div></section>`;
   }
 
+  async function loadDevices() {
+    const r = await api("/api/devices");
+    if (!r.ok) { if (r.code !== 401) flash(r.message, "error"); return; }
+    D = r.data;
+    if (page === "devices") render();
+  }
+
+  function deviceRows(devices) {
+    if (!devices.length) return `<div class="empty"><strong>Aucun appareil relié</strong>Générez un code ci-dessus pour transformer un téléphone, une tablette ou un PC en kiosque d'entrée.</div>`;
+    return `<table><thead><tr><th>Appareil</th><th>Type</th><th>Dernière activité</th><th>Actions</th></tr></thead><tbody>` +
+      devices.map((d) => `<tr class="${d.online ? "is-online" : ""}">
+        <td><span class="device-dot"></span>${esc(d.name)}${d.online ? ' <span class="badge badge-live">en ligne</span>' : ""}</td>
+        <td class="muted">${esc(d.kind_label)}</td>
+        <td class="muted small">${d.last_seen_at ? esc(new Date(d.last_seen_at).toLocaleString("fr-FR", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })) : "jamais"}</td>
+        <td class="actions">
+          <form class="inline" data-api="/api/devices/${d.id}/rename"><input name="name" required maxlength="60" value="${esc(d.name)}" aria-label="Nouveau nom"><button class="btn btn-ghost btn-sm" type="submit">Renommer</button></form>
+          <button class="btn btn-danger btn-sm" type="button" data-action="device-revoke" data-device="${d.id}" data-name="${esc(d.name)}">Révoquer</button>
+        </td></tr>`).join("") + "</tbody></table>";
+  }
+
+  function pairingRows(pairings) {
+    if (!pairings.length) return "";
+    return `<table><thead><tr><th>Code</th><th>Appareil visé</th><th>Valable</th><th></th></tr></thead><tbody>` +
+      pairings.map((p) => `<tr>
+        <td class="mono"><strong>${esc(p.code)}</strong></td>
+        <td>${esc(p.name)} <span class="muted small">— ${esc(p.kind_label)}</span></td>
+        <td class="pair-timer" data-expires="${p.expires_at}" aria-live="off">…</td>
+        <td class="actions"><button class="btn btn-link btn-sm" type="button" data-action="pair-cancel" data-code="${esc(p.code)}">Annuler</button></td>
+      </tr>`).join("") + "</tbody></table>";
+  }
+
+  function renderDevices() {
+    const origin = location.origin;
+    const link = origin + "/kiosk";
+    return `<div class="page-head"><h1>Appareils reliés</h1><span class="muted small">Un kiosque sur n'importe quel écran à l'entrée</span></div>
+      <section class="card">
+        <div class="card-head"><h2>Relier un appareil</h2>
+          <p class="muted small">Un code à usage unique, valable 10 minutes. Sur l'autre appareil, ouvrez <code>${esc(link)}</code> et saisissez-le : le kiosque ne saura que reconnaître un visage et journaliser un passage — ni vos listes, ni vos abonnements, ni vos réglages.</p>
+        </div>
+        <form class="inline-form" id="pair-form">
+          <label>Nom de l'appareil<input name="name" required minlength="2" maxlength="60" placeholder="Borne entrée, Tablette accueil…" autocomplete="off"></label>
+          <label>Type de matériel
+            <select name="kind">${DEVICE_KINDS.map(([v, l]) => `<option value="${v}">${esc(l)}</option>`).join("")}</select>
+          </label>
+          <button class="btn btn-primary" type="submit">Générer le code</button>
+        </form>
+        <div id="pair-result"></div>
+      </section>
+      ${D.pairings.length ? `<section class="card"><div class="card-head"><h2>Codes en attente (${D.pairings.length})</h2></div>${pairingRows(D.pairings)}</section>` : ""}
+      <section class="card"><div class="card-head"><h2>Ce qui est relié (${D.devices.length})</h2></div>${deviceRows(D.devices)}</section>
+      <section class="card card-quiet">
+        <div class="card-head"><h2>Caméra réseau ou boîtier sans navigateur</h2></div>
+        <p class="muted small">Une page web ne sait pas lire un flux RTSP, et une caméra refuse les requêtes venues d'un autre site (CORS). Le chemin fiable : un petit relais sur place — Raspberry Pi, mini-PC, le NAS de l'entreprise — détecte le visage et envoie la décision à l'API avec le jeton de l'appareil.</p>
+        <pre><code>curl -s -X POST ${esc(origin)}/api/pair \\
+  -H 'Content-Type: application/json' -d '{"code":"ABK7QD","kind":"box"}'   # → {"token":"…"}
+
+FACEID_TOKEN=… curl -s -X POST ${esc(origin)}/api/device/recognized \\
+  -H "Authorization: Bearer $FACEID_TOKEN" -H 'Content-Type: application/json' \\
+  -d '{"member_id":12,"distance":0.31}'</code></pre>
+        <p class="muted small">Le relais prêt à l'emploi est dans <code>tools/kiosk-relay.py</code> ; il prend en charge la caméra USB et les instantanés HTTP d'une caméra IP. Le jeton n'est affiché qu'une fois, au moment de l'appairage : en cas de perte, révoquez l'appareil et générez un nouveau code.</p>
+      </section>`;
+  }
+
+  // --- the pairing sheet: code boxes, QR, countdown, copy/print ---
+  function qrSvg(text) {
+    if (typeof window.qrcode !== "function") return null;
+    const qr = window.qrcode(0, "M");
+    qr.addData(text);
+    qr.make();
+    const n = qr.getModuleCount();
+    let d = "";
+    for (let r = 0; r < n; r++) for (let c = 0; c < n; c++) if (qr.isDark(r, c)) d += `M${c} ${r}h1v1h-1z`;
+    const NS = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(NS, "svg");
+    svg.setAttribute("viewBox", `0 0 ${n} ${n}`);
+    svg.setAttribute("width", String(n));
+    svg.setAttribute("height", String(n));
+    svg.setAttribute("role", "img");
+    svg.setAttribute("aria-label", "Code QR menant au kiosque, code d'appairage inclus");
+    const path = document.createElementNS(NS, "path");
+    path.setAttribute("d", d);
+    svg.appendChild(path);
+    return svg;
+  }
+
+  function paintPairing() {
+    const box = document.getElementById("pair-result");
+    if (!box) return;
+    if (!pendingPair) { box.innerHTML = ""; return; }
+    const { code, name, link, expiresAt } = pendingPair;
+    box.textContent = "";
+    const wrap = document.createElement("div");
+    wrap.className = "pair-grid";
+    wrap.style.marginTop = "1rem";
+    wrap.style.paddingTop = "1rem";
+    wrap.style.borderTop = "1px solid var(--border)";
+    const left = document.createElement("div");
+    left.innerHTML = `<h2>${esc(name)} — à saisir sur l'appareil</h2>
+      <div class="pair-code">${code.split("").map((ch) => `<b>${ch}</b>`).join("")}</div>
+      <p class="pair-link"><code>${esc(link)}</code><button class="btn btn-ghost btn-sm" type="button" data-action="copy-link" data-copy="${esc(link)}">Copier le lien</button><button class="btn btn-link btn-sm" type="button" data-action="pair-print">Imprimer la fiche</button></p>
+      <p class="pair-timer" id="pair-countdown" data-expires="${expiresAt}" data-suffix="usage unique"></p>
+      <ol class="pair-steps">
+        <li>Sur l'autre appareil, ouvrez ce lien (ou scannez le QR) : le kiosque s'affiche.</li>
+        <li>Le code est déjà dans le lien ; sinon, tapez-le, sans majuscules compliquées.</li>
+        <li>Le kiosque démarre caméra et journal des passages. Ce code ne fonctionnera plus ensuite.</li>
+      </ol>`;
+    const side = document.createElement("div");
+    side.className = "pair-side";
+    const frame = document.createElement("div");
+    frame.className = "qr-frame";
+    const svg = qrSvg(link);
+    if (svg) frame.appendChild(svg);
+    else { const p = document.createElement("p"); p.className = "muted small"; p.textContent = "QR indisponible : utilisez le lien."; frame.appendChild(p); }
+    side.appendChild(frame);
+    const tip = document.createElement("small");
+    tip.className = "muted";
+    tip.textContent = "À scanner avec l'appareil à relier";
+    side.appendChild(tip);
+    wrap.appendChild(left);
+    wrap.appendChild(side);
+    box.appendChild(wrap);
+  }
+
+  // Remaining time is a display concern: the API says when a code dies, the board counts down to
+  // it. A chain of one-second timeouts rather than an interval — and it ends by itself as soon as
+  // the page moves on or the last code is spent, so nothing keeps a tab (or a test run) alive.
+  function paintCountdowns() {
+    clearTimeout(countdownTimer);
+    countdownTimer = null;
+    const cells = [...document.querySelectorAll(".pair-timer[data-expires]")];
+    if (!cells.length) return;
+    let spent = false;
+    for (const cell of cells) {
+      const left = Math.max(0, Math.round((Number(cell.dataset.expires) - Date.now()) / 1000));
+      const text = `${String(Math.floor(left / 60)).padStart(2, "0")}:${String(left % 60).padStart(2, "0")}`;
+      cell.textContent = (left ? "valable " + text : "expiré") + (cell.dataset.suffix ? " — " + cell.dataset.suffix : "");
+      cell.classList.toggle("urgent", left > 0 && left < 60);
+      if (!left) { spent = true; if (cell.id === "pair-countdown") pendingPair = null; }
+    }
+    if (spent) { loadDevices(); return; } // an expired code is not worth leaving on the board
+    countdownTimer = setTimeout(paintCountdowns, 1000);
+  }
+
   function renderSettings() {
     const s = sec();
-    return `<h1>Paramètres de l'espace</h1>
+    return `<div class="page-head"><h1>Paramètres de l'espace</h1><span class="muted small">${esc(s.label)}</span></div>
       <section class="card"><h2>Entreprise</h2>
         <form class="stack" data-api="/api/settings">
           <label>Nom de l'entreprise<input name="company" required maxlength="100" value="${esc(S.org.name)}"></label>
@@ -303,15 +454,25 @@
 
   const pageEl = document.getElementById("page");
   function render() {
+    if (page !== "devices") { clearTimeout(countdownTimer); countdownTimer = null; clearTimeout(liveTimer); }
     sector = S.org.sector;
     document.body.className = "app sector-" + sector;
     document.title = S.org.name + " — FaceID Platform";
     document.getElementById("org-name").textContent = S.org.name;
     document.getElementById("org-sector").textContent = S.sector.label;
     document.getElementById("user-email").textContent = S.user.email;
-    const labels = { overview: "Tableau de bord", members: cap(S.sector.people), access: S.sector.rule === "attendance" ? "Pointage" : "Contrôle d'accès", settings: "Paramètres" };
+    const labels = { overview: "Tableau de bord", members: cap(S.sector.people), access: S.sector.rule === "attendance" ? "Pointage" : "Contrôle d'accès", devices: "Appareils reliés", settings: "Paramètres" };
     document.querySelectorAll("#menu a").forEach((a) => { a.textContent = labels[a.dataset.page]; a.classList.toggle("active", a.dataset.page === page); });
 
+    if (page === "devices") {
+      if (!D) { loadDevices(); return; }
+      pageEl.innerHTML = renderDevices();
+      paintPairing();
+      paintCountdowns();
+      refreshVoiceInfo();
+      keepDevicesFresh();
+      return;
+    }
     if (page === "access" && document.getElementById("rec-video")) {
       // Keep the running camera: only refresh the dynamic parts.
       document.getElementById("manual-list").innerHTML = manualList();
@@ -334,11 +495,28 @@
     const r = await api("/api/state");
     if (!r.ok) { if (r.code !== 401) flash(r.message, "error"); return; }
     S = r.data;
+    // The devices board shows what another screen is doing right now: never render it from a cache.
+    if (page === "devices") { D = null; render(); await loadDevices(); return; }
     render();
   }
 
   // ---- Actions ---------------------------------------------------------------
   pageEl.addEventListener("submit", async (event) => {
+    const pairForm = event.target.closest("#pair-form");
+    if (pairForm) {
+      event.preventDefault();
+      const payload = Object.fromEntries(new FormData(pairForm).entries());
+      const btn = pairForm.querySelector("button[type=submit]");
+      btn.disabled = true;
+      const r = await api("/api/devices/pairing", payload);
+      btn.disabled = false;
+      flash(r.message, r.ok ? "success" : "error");
+      if (r.ok) {
+        pendingPair = { code: r.data.code, name: r.data.name, link: location.origin + r.data.link, expiresAt: Date.now() + r.data.expires_in * 1000 };
+        await loadDevices();
+      }
+      return;
+    }
     const form = event.target.closest("form[data-api]");
     if (!form) return;
     event.preventDefault();
@@ -367,6 +545,27 @@
     if (!btn) return;
     const id = btn.dataset.id;
     const action = btn.dataset.action;
+    if (action === "copy-link") {
+      const link = btn.dataset.copy;
+      try { await navigator.clipboard.writeText(link); flash("Lien copié : ouvrez-le sur l'appareil à relier."); }
+      catch (_) { flash("Copiez le lien à la main : " + link, "error"); }
+      return;
+    }
+    if (action === "pair-print") { window.print(); return; }
+    if (action === "pair-cancel") {
+      const r = await api("/api/devices/pairing/cancel", { code: btn.dataset.code });
+      if (pendingPair && pendingPair.code === btn.dataset.code) pendingPair = null;
+      await loadDevices();
+      flash(r.message, r.ok ? "success" : "error");
+      return;
+    }
+    if (action === "device-revoke") {
+      if (window.confirm && !window.confirm("Révoquer « " + btn.dataset.name + " » ? Son kiosque cesse de fonctionner immédiatement.")) return;
+      const r = await api("/api/devices/" + btn.dataset.device + "/revoke", {});
+      await loadDevices();
+      flash(r.message, r.ok ? "success" : "error");
+      return;
+    }
     if (action === "enroll") { enrollDialog.open(Number(id), btn.dataset.name); return; }
     if (action === "delete" && !window.confirm("Supprimer " + btn.dataset.name + " et toutes ses données ?")) return;
     btn.disabled = true;
@@ -376,8 +575,19 @@
     if (r.ok || r.status === "already") { await refresh(); if (action === "revoke") kiosk.reloadKnown(); }
   });
 
+  // The devices page is a live board: an apparatus that just came online should show up.
+  // A timeout chain, not an interval — a timer that never ends would keep the page (and the
+  // test runner) alive forever; this one stops as soon as we leave the page or it is hidden.
+  let liveTimer = null;
+  function keepDevicesFresh() {
+    clearTimeout(liveTimer);
+    if (page !== "devices" || !S || document.hidden) return;
+    liveTimer = setTimeout(async () => { await loadDevices(); keepDevicesFresh(); }, 20000);
+  }
+
   document.getElementById("logout").addEventListener("click", async () => { await api("/api/logout", {}); location.href = "/"; });
-  window.addEventListener("hashchange", () => { const p = location.hash.slice(1); if (PAGES.includes(p) && p !== page) { page = p; if (S) render(); } });
+  window.addEventListener("hashchange", () => { const p = location.hash.slice(1); if (PAGES.includes(p) && p !== page) { page = p; if (p === "devices") D = null; if (S) render(); } });
+  document.addEventListener("visibilitychange", () => { if (page === "devices") { if (document.hidden) clearTimeout(liveTimer); else keepDevicesFresh(); } });
 
   // ---- Enrollment dialog -----------------------------------------------------
   const enrollDialog = (() => {

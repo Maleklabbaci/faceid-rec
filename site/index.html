@@ -25,9 +25,10 @@
     <a class="btn btn-ghost btn-lg" href="#secteurs">Voir les cas d'usage</a>
   </div>
   <ul class="hero-points">
-    <li>✔ Inscription en 1 seconde : nom → capturer → terminé</li>
-    <li>✔ Voix qui annonce « Accès autorisé » / « Accès refusé »</li>
-    <li>✔ Reconnaissance dans le navigateur : aucune image envoyée sur Internet</li>
+    <li>Inscription en 1 seconde : nom → capturer → terminé</li>
+    <li>Voix qui annonce « Accès autorisé » / « Accès refusé »</li>
+    <li>Reconnaissance dans le navigateur : aucune image envoyée sur Internet</li>
+    <li>Un kiosque à relier sur téléphone, tablette, PC ou caméra</li>
   </ul>
 </section>
 
@@ -62,12 +63,35 @@
   </div>
 </section>
 
+<section id="appareils" class="sectors">
+  <h2>Un kiosque sur chaque écran de l'entrée</h2>
+  <p class="lead">Le même visage, le même journal, la même voix — sur n'importe quel écran de votre entrée. Aucun matériel dédié à acheter.</p>
+  <div class="grid cases">
+    <article class="card case">
+      <h3>📱 Téléphone ou tablette</h3>
+      <p><strong>Le geste :</strong> dans votre espace, onglet <em>Appareils reliés</em>, vous générez un code. Sur l'autre appareil, scannez le QR affiché : le kiosque s'ouvre tout seul.</p>
+      <p><strong>Ce qu'il peut faire :</strong> reconnaître un visage et journaliser le passage. Rien d'autre — ni liste des membres, ni abonnements, ni réglages.</p>
+    </article>
+    <article class="card case">
+      <h3>💻 Poste d'accueil ou vieux PC</h3>
+      <p><strong>Le geste :</strong> même code, dans n'importe quel navigateur. Le mode automatique laisse la borne tourner sans personne derrière.</p>
+      <p><strong>Le gain :</strong> un écran déjà acheté fait le travail d'une borne à 2 000 €, avec la voix et le journal.</p>
+    </article>
+    <article class="card case">
+      <h3>🎥 Caméra réseau ou boîtier sur site</h3>
+      <p><strong>Le geste :</strong> un petit relais (Raspberry Pi, mini-PC) lit le flux de la caméra et envoie la décision à l'API avec le jeton de l'appareil.</p>
+      <p><strong>Pourquoi :</strong> un navigateur ne sait pas lire un flux RTSP et une caméra refuse les requêtes d'un autre site. Le relais est le chemin fiable — et il ouvre la porte, lui, le sait faire.</p>
+    </article>
+  </div>
+  <p class="muted small">Chaque appareil est nominatif, daté, révocable en un clic depuis votre espace.</p>
+</section>
+
 <section class="features">
   <h2>Comment ça marche</h2>
   <div class="grid steps">
     <article class="card"><span class="step">1</span><h3>Créez votre espace</h3><p>Nom de l'entreprise, secteur, email : votre espace privé est prêt en 30 secondes, sans carte bancaire.</p></article>
     <article class="card"><span class="step">2</span><h3>Enregistrez les visages</h3><p>Tapez le nom, cliquez sur Capturer : la personne regarde la webcam une seconde. Son accord est recueilli, ses données effaçables à tout moment.</p></article>
-    <article class="card"><span class="step">3</span><h3>Laissez le kiosque tourner</h3><p>Un PC ou une tablette à l'entrée, mode automatique activé : la voix annonce le résultat, le journal se remplit tout seul.</p></article>
+    <article class="card"><span class="step">3</span><h3>Laissez le kiosque tourner</h3><p>Un PC, une tablette ou un téléphone à l'entrée, relié par un code, mode automatique activé : la voix annonce le résultat, le journal se remplit tout seul.</p></article>
   </div>
 </section>
 

@@ -7,22 +7,32 @@
   <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body class="app sector-fitness" data-voice-base="/voice/">
+<header class="app-bar">
+  <a class="brand" href="/"><span class="logo">F</span> FaceID <span class="brand-sub">Plateforme</span></a>
+  <div class="bar-mid">
+    <span class="org-chip" id="org-name">…</span>
+    <span class="badge badge-sector" id="org-sector"></span>
+  </div>
+  <div class="bar-actions">
+    <button class="btn btn-ghost btn-sm js-voice-toggle" type="button" aria-pressed="true" title="Annonces vocales du kiosque">🔊 Voix</button>
+    <a class="btn btn-ghost btn-sm" href="/kiosk">Ouvrir le kiosque</a>
+    <span class="who" id="user-email"></span>
+    <button class="btn btn-ghost btn-sm" type="button" id="logout">Déconnexion</button>
+  </div>
+</header>
+
 <div class="shell">
   <aside class="sidebar">
-    <a class="brand brand-light" href="/"><span class="logo">F</span> FaceID</a>
-    <div class="org">
-      <strong id="org-name">…</strong>
-      <span class="badge badge-sector" id="org-sector"></span>
-    </div>
-    <nav class="menu" id="menu">
+    <nav class="menu" id="menu" aria-label="Navigation de l'espace">
       <a href="#overview" data-page="overview">Tableau de bord</a>
       <a href="#members" data-page="members">Membres</a>
       <a href="#access" data-page="access">Contrôle d'accès</a>
+      <a href="#devices" data-page="devices">Appareils</a>
       <a href="#settings" data-page="settings">Paramètres</a>
     </nav>
-    <div class="logout">
-      <span class="muted small" id="user-email"></span>
-      <button class="btn btn-ghost btn-sm" type="button" id="logout">Déconnexion</button>
+    <div class="side-note">
+      <strong>Reconnaissance locale</strong>
+      <span>Les visages sont analysés dans ce navigateur. Seule une empreinte numérique est enregistrée, effaçable à tout moment.</span>
     </div>
   </aside>
 
@@ -49,6 +59,7 @@
 </dialog>
 
 <script src="/vendor/face-api.js" defer></script>
+<script src="/vendor/qr.js" defer></script>
 <script src="/assets/face.js" defer></script>
 <script src="/assets/app.js" defer></script>
 </body>

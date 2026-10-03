@@ -10,19 +10,29 @@
 <main class="auth-wrap">
   <a class="brand" href="/"><span class="logo">F</span> FaceID Platform</a>
   <section class="card auth-card">
-    <h1>Connexion à votre espace</h1>
+    <p class="eyebrow">Espace entreprise</p>
+    <h1>Reprendre votre espace</h1>
+    <p class="muted small">Chaque entreprise ne voit que ses propres adhérents, son propre journal et ses propres appareils.</p>
     <p class="flash" id="flash" hidden></p>
     <form id="auth-form" data-endpoint="/api/login">
       <label>Email professionnel
-        <input type="email" name="email" required maxlength="254" autocomplete="username">
+        <input type="email" name="email" required maxlength="254" autocomplete="username" autofocus>
       </label>
       <label>Mot de passe
         <input type="password" name="password" required maxlength="256" autocomplete="current-password">
       </label>
-      <button class="btn btn-primary btn-block" type="submit">Se connecter</button>
+      <button class="btn btn-primary btn-block btn-lg" type="submit">Se connecter</button>
     </form>
-    <p class="muted small">Pas encore d'espace ? <a href="/signup">Créer un compte</a></p>
+    <div class="auth-foot">
+      <span class="muted small">Pas encore d'espace ?</span>
+      <a class="btn btn-ghost btn-sm" href="/signup">Créer un compte</a>
+    </div>
   </section>
+  <ul class="hero-points">
+    <li>Kiosque sur téléphone, tablette ou PC</li>
+    <li>Aucune image envoyée sur Internet</li>
+    <li>Sans badge ni carte</li>
+  </ul>
 </main>
 <script src="/assets/auth.js" defer></script>
 </body>

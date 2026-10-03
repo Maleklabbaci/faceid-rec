@@ -1,232 +1,34 @@
-// Browser-level tests for the Cloudflare Pages edition: the auth pages (login.html,
-// signup.html + assets/auth.js) and the app shell (app.html + face.js + app.js) run inside a
-// real DOM (jsdom) against a live `wrangler pages dev` server. Markup, form handling, fetch
-// payloads, session cookies, rendering and CSP-safe styling are exercised the way a browser
-// does it; face-api.js itself is replaced by a fake engine so the facial pipeline can be
-// driven deterministically. API-only rules live in tests/cloudflare.test.mjs.
+// Browser-level tests for the Cloudflare Pages edition: the auth pages (login.html, signup.html +
+// assets/auth.js) and the app shell (app.html + face.js + app.js) run inside a real DOM (jsdom)
+// against a live `wrangler pages dev` server. Markup, form handling, fetch payloads, session
+// cookies, rendering and CSP-safe styling are exercised the way a browser does it; face-api.js is
+// replaced by a stub so the facial pipeline can be driven deterministically. API-only rules live in
+// tests/cloudflare.test.mjs, the linked-device screens in tests/kiosk-ui.test.mjs.
 //
 // Usage: `npm run test:ui` (starts its own server) — or FACEID_URL=http://127.0.0.1:8788 npm run test:ui
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { readFileSync, existsSync } from "node:fs";
-import { networkInterfaces } from "node:os";
-import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
-import { JSDOM, VirtualConsole } from "jsdom";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { SITE, env, uniq, today, LAN_IP, waitFor, startServer, stopServer, makeJar, raw, space, openPage, fill, flashOf, descriptorFor } from "./browser-harness.mjs";
 
-const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-const SITE = join(ROOT, "site");
 const PORT = 8791;
 let BASE = process.env.FACEID_URL || "";
-let server = null;
-
-async function waitFor(url, ms = 90000) {
-  const end = Date.now() + ms;
-  while (Date.now() < end) {
-    try { const r = await fetch(url); if (r.status < 500) return; } catch (_) { /* not up yet */ }
-    await new Promise((r) => setTimeout(r, 500));
-  }
-  throw new Error("server did not start: " + url);
-}
+let handle = null;
+let LAN_BASE = null;
 
 before(async () => {
   if (!BASE) {
-    BASE = `http://127.0.0.1:${PORT}`;
-    server = spawn("npx", ["wrangler", "pages", "dev", "site", "--d1", "DB=faceid-ui", "--port", String(PORT), "--ip", "0.0.0.0", "--persist-to", ".wrangler/test-ui"], { cwd: ROOT, stdio: "ignore", detached: true });
+    handle = startServer({ port: PORT, d1: "DB=faceid-ui", persistTo: ".wrangler/test-ui" });
+    BASE = handle.base;
   }
+  env.BASE = BASE;
   await waitFor(BASE + "/api/healthz");
-  LAN_BASE = LAN_IP ? `http://${LAN_IP}:${new URL(BASE).port || PORT}` : null;
+  LAN_BASE = env.LAN_BASE = LAN_IP ? `http://${LAN_IP}:${new URL(BASE).port || PORT}` : null;
 });
-after(() => { if (server) { try { process.kill(-server.pid, "SIGTERM"); } catch (_) { server.kill("SIGTERM"); } } });
 
-const uniq = () => Math.random().toString(36).slice(2, 8);
-const today = new Date().toISOString().slice(0, 10);
-// The kiosk scenario: same app, reached through a plain-HTTP address that is not loopback.
-const LAN_IP = Object.values(networkInterfaces()).flat().find((a) => a && a.family === "IPv4" && !a.internal)?.address;
-let LAN_BASE = null;
+after(() => stopServer(handle));
 
-// ---------------------------------------------------------------------------
-// Cookie jar with browser semantics: a Secure cookie is refused outside a secure context.
-// ---------------------------------------------------------------------------
-let visitors = 0;
-function makeJar({ secure = true } = {}) {
-  const store = new Map();
-  const dropped = [];
-  const ip = `198.51.100.${10 + (++visitors % 200)}`; // rate limits are per visitor
-  return {
-    absorb(res) {
-      const lines = typeof res.headers.getSetCookie === "function" ? res.headers.getSetCookie() : [res.headers.get("set-cookie")].filter(Boolean);
-      for (const line of lines) {
-        const [pair, ...attrs] = line.split(";");
-        const at = pair.indexOf("=");
-        const name = pair.slice(0, at).trim();
-        const value = pair.slice(at + 1).trim();
-        const flags = attrs.map((a) => a.trim().toLowerCase());
-        if (flags.includes("secure") && !secure) { dropped.push(name); continue; }
-        if (value === "" || flags.includes("max-age=0")) store.delete(name);
-        else store.set(name, value);
-      }
-    },
-    ip,
-    cookie: () => [...store].map(([k, v]) => `${k}=${v}`).join("; "),
-    has: (name) => store.has(name),
-    dropped: () => [...dropped],
-    forget: (name) => store.delete(name),
-  };
-}
-
-async function raw(path, { method, body, jar, headers = {}, base = BASE } = {}) {
-  const h = new Headers({ "CF-Connecting-IP": (jar && jar.ip) || `198.51.100.7`, ...headers });
-  if (!h.has("Origin")) h.set("Origin", base);
-  if (!h.has("Sec-Fetch-Site")) h.set("Sec-Fetch-Site", "same-origin");
-  if (jar && jar.cookie()) h.set("Cookie", jar.cookie());
-  if (body !== undefined) h.set("Content-Type", "application/json");
-  const res = await fetch(base + path, { method: method || (body !== undefined ? "POST" : "GET"), headers: h, body: body !== undefined ? JSON.stringify(body) : undefined, redirect: "manual" });
-  if (jar) jar.absorb(res);
-  let data = null;
-  try { data = await res.clone().json(); } catch (_) { /* html */ }
-  return { status: res.status, data, headers: res.headers };
-}
-
-// One company per sector, created through the API, so each DOM test stands on its own.
-const spaces = new Map();
-async function space(sector = "office") {
-  if (!spaces.has(sector)) {
-    const jar = makeJar();
-    const email = `ui-${sector}-${uniq()}@example.com`;
-    const r = await raw("/api/signup", { body: { company: `Espace ${sector} ${uniq()}`, sector, email, password: "motdepasse-ui-123" }, jar });
-    assert.equal(r.status, 200, JSON.stringify(r.data));
-    const state = await raw("/api/state", { jar });
-    spaces.set(sector, { jar, email, password: "motdepasse-ui-123", state: state.data });
-  }
-  return spaces.get(sector);
-}
-
-// ---------------------------------------------------------------------------
-// DOM harness: the HTML the server actually sends, plus that page's own scripts.
-// jsdom has no CSP engine, so inline-style injection is caught by watching innerHTML.
-// ---------------------------------------------------------------------------
-function makeFaceEngineStub(faceState) {
-  return {
-    tf: { setBackend: async () => true, ready: async () => {}, getBackend: () => "test" },
-    nets: {
-      tinyFaceDetector: { loadFromUri: async () => { faceState.loads += 1; } },
-      faceLandmark68TinyNet: { loadFromUri: async () => {} },
-      faceRecognitionNet: { loadFromUri: async () => {} },
-    },
-    TinyFaceDetectorOptions: class { constructor(options) { Object.assign(this, options); } },
-    detectAllFaces: () => ({
-      withFaceLandmarks: () => ({
-        withFaceDescriptors: async () => faceState.faces.map((d) => ({ descriptor: Float32Array.from(d), detection: { box: { ...faceState.box, area: faceState.box.width * faceState.box.height } } })),
-      }),
-    }),
-  };
-}
-
-async function openPage(path, jar, { base = BASE, faceState } = {}) {
-  const state = faceState || { loads: 0, faces: [], box: { x: 0, y: 0, width: 300, height: 400 } };
-  const html = await (await fetch(base + path)).text();
-  const navigations = [];
-  const errors = [];
-  const inlineStyles = [];
-  const vc = new VirtualConsole();
-  vc.on("jsdomError", (err) => {
-    if (/not implemented: navigation/i.test(err.message)) navigations.push(err.message);
-    else errors.push("jsdomError: " + err.message);
-  });
-
-  const dom = new JSDOM(html, { url: base + path, runScripts: "outside-only", pretendToBeVisual: true, virtualConsole: vc });
-  const { window } = dom;
-  window.faceapi = makeFaceEngineStub(state);
-
-  // the handful of browser APIs jsdom does not ship
-  window.HTMLMediaElement.prototype.play = () => Promise.resolve();
-  window.HTMLMediaElement.prototype.pause = () => {};
-  try {
-    Object.defineProperty(window.HTMLMediaElement.prototype, "srcObject", {
-      configurable: true,
-      get() { return this.__srcObject ?? null; },
-      set(value) { this.__srcObject = value; },
-    });
-  } catch (_) { /* jsdom ships a usable one */ }
-  for (const [prop, value] of [["videoWidth", 640], ["videoHeight", 480]]) {
-    try { Object.defineProperty(window.HTMLVideoElement.prototype, prop, { configurable: true, get: () => value }); } catch (_) { /* provided by jsdom */ }
-  }
-  window.Audio = class { constructor() { this.paused = true; this.ended = true; } play() { return Promise.resolve(); } pause() {} set src(_v) {} get src() { return ""; } };
-  const dialog = window.HTMLDialogElement.prototype;
-  if (typeof dialog.showModal !== "function" || typeof dialog.close !== "function") {
-    Object.defineProperty(dialog, "open", { configurable: true, get() { return this.__open === true; } });
-    dialog.show = function () { this.__open = true; };
-    dialog.showModal = function () { this.__open = true; };
-    dialog.close = function () { this.__open = false; };
-  }
-  window.confirm = () => true;
-  window.alert = () => {};
-  try {
-    Object.defineProperty(window.navigator, "mediaDevices", {
-      configurable: true,
-      value: { getUserMedia: async () => ({ getTracks: () => [{ kind: "video", stop() {}, addEventListener() {}, removeEventListener() {} }] }) },
-    });
-  } catch (_) { /* leave it absent: the "no camera" branch then runs */ }
-
-  // A style attribute written into markup is refused by `style-src 'self'`: record it.
-  const innerHTML = Object.getOwnPropertyDescriptor(window.Element.prototype, "innerHTML");
-  Object.defineProperty(window.Element.prototype, "innerHTML", {
-    configurable: true,
-    get() { return innerHTML.get.call(this); },
-    set(value) {
-      const at = typeof value === "string" ? value.search(/\sstyle\s*=/) : -1;
-      if (at >= 0) inlineStyles.push(value.slice(Math.max(0, at - 40), at + 90));
-      innerHTML.set.call(this, value);
-    },
-  });
-
-  const calls = [];
-  window.fetch = async (input, init = {}) => {
-    const url = new URL(typeof input === "string" ? input : input.url, base);
-    const r = await raw(url.pathname + url.search, {
-      method: init.method,
-      body: typeof init.body === "string" ? JSON.parse(init.body) : undefined,
-      jar,
-      base,
-      headers: init.headers,
-    });
-    calls.push({ path: url.pathname, status: r.status, data: r.data });
-    return new Response(JSON.stringify(r.data ?? {}), { status: r.status, headers: { "Content-Type": "application/json" } });
-  };
-
-  for (const src of [...window.document.querySelectorAll("script[src]")].map((s) => s.getAttribute("src"))) {
-    const file = join(SITE, src.replace(/^\//, ""));
-    if (!existsSync(file)) { errors.push(`the page loads ${src} but the file is missing`); continue; }
-    if (src.includes("face-api.js")) continue; // replaced by the stub above (1.3 MB of TF.js is not the subject)
-    window.eval(readFileSync(file, "utf8"));
-  }
-  const flush = async (rounds = 12, ms = 40) => { for (let i = 0; i < rounds; i++) await new Promise((r) => setTimeout(r, ms)); };
-  await flush();
-  return { window, dom, document: window.document, calls, navigations, errors, inlineStyles, state, flush };
-}
-
-async function fill(ctx, form, fields) {
-  for (const [name, value] of Object.entries(fields)) {
-    const el = form.elements[name];
-    assert.ok(el, `the form has a "${name}" field`);
-    el.value = value;
-  }
-  form.requestSubmit();
-  await ctx.flush();
-}
-
-const flashOf = (ctx) => {
-  const el = ctx.document.getElementById("flash");
-  return { hidden: el.hidden, text: el.textContent.trim(), cls: el.className };
-};
-
-const descriptorFor = (seed) => Array.from({ length: 128 }, (_, i) => Math.sin(seed + i) / 11);
-
-// ---------------------------------------------------------------------------
-// The two auth pages
-// ---------------------------------------------------------------------------
 test("landing page: every link it advertises resolves, including login and signup", async () => {
   const ctx = await openPage("/", makeJar());
   const links = [...ctx.document.querySelectorAll("a")].map((a) => a.getAttribute("href"));

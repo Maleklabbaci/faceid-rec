@@ -15,15 +15,20 @@ Les deux éditions web partagent le même produit (espace privé par entreprise,
 ## 0. Édition Cloudflare (Pages + Functions + D1) — mise en ligne en 6 réglages
 
 ```
-site/                      interface statique (accueil, connexion, application, kiosque)
+site/                      interface statique (accueil, connexion, application, kiosque, appareils)
+site/kiosk.html            kiosque autonome pour téléphone / tablette / PC / borne (relié par un code)
 site/vendor/face-api.js    moteur facial navigateur (détection + empreinte 128-d)
+site/vendor/qr.js          générateur de QR local (aucun CDN, CSP stricte)
 site/models/               poids des 3 réseaux (≈ 6,5 Mo, mis en cache un an)
-functions/api/[[route]].js API JSON : comptes, membres, enrôlement, reconnaissance, règles secteur, journal
+functions/api/[[route]].js API JSON : comptes, membres, enrôlement, reconnaissance, règles secteur, journal, appareils reliés
+tools/kiosk-relay.py       relais sur site pour caméra IP / boîtier sans navigateur (jeton Bearer)
 schema.sql                 schéma D1 (créé automatiquement au premier appel)
 tests/binding.test.mjs     6 tests du câblage D1 (mauvais type de liaison → message clair)
-tests/cloudflare.test.mjs  10 tests de bout en bout de l'API (npm test)
+tests/cloudflare.test.mjs  15 tests de bout en bout de l'API, dont le cycle complet d'un appareil relié
 tests/ui-flow.test.mjs     14 tests « vrai navigateur » : formulaires login/inscription,
                            session, tableau de bord, capture, kiosque (npm run test:ui)
+tests/kiosk-ui.test.mjs    10 tests du kiosque relié et de l'écran « Appareils » (npm run test:kiosk)
+tests/test_relay.py        10 tests du relais caméra (pytest)
 ```
 
 Réglages du projet Pages : *Build output directory* = `site`, base D1 `faceid` liée sous le nom **`DB`**
@@ -34,8 +39,16 @@ branche de production `main`. Détail pas à pas, dépannage de l'erreur SSL des
 npm install && npm run dev     # http://localhost:8788 avec une base D1 locale
 npm test                       # tests API (démarre un serveur wrangler local)
 npm run test:ui                # les pages jouées dans un DOM (jsdom) contre le serveur réel
-npm run test:all               # les deux suites
+npm run test:kiosk             # le kiosque relié + l'écran « Appareils » (QR, code, révocation)
+npm run test:all               # les quatre suites
 ```
+
+**Relier un téléphone, une tablette, un PC ou une caméra** : l'espace entreprise a un onglet
+« Appareils reliés » qui génère un code à 6 caractères (10 minutes, usage unique) avec QR et lien à
+partager. L'appareil relie devient un kiosque `/kiosk` : il reconnaît et journalise, et ne voit ni
+liste des membres, ni abonnements, ni réglages — limitation vérifiée côté serveur, pas seulement
+dans l'interface. Une caméra réseau passe par `tools/kiosk-relay.py` (jeton `Bearer`, porte pilotée
+localement). Guide complet : **[deploy/devices.md](deploy/devices.md)**.
 
 Comment la reconnaissance fonctionne sans serveur : le kiosque calcule l'empreinte du visage dans le navigateur, la compare aux empreintes des membres de l'entreprise (téléchargées via `GET /api/descriptors`, consentement requis) et n'envoie que la décision (`POST /api/recognized`) ; l'API applique les règles (expiration, un repas/jour, retards, doublons 60 s) et tient le journal. Aucune image ne transite sur Internet.
 
@@ -94,8 +107,8 @@ Mots de passe hachés (Werkzeug), jeton CSRF sur tous les POST, cookies `HttpOnl
 
 ### Tests
 ```bash
-pip install pytest && python -m pytest -q tests   # édition Flask
-npm install && npm run test:all                   # édition Cloudflare (API + DOM)
+pip install pytest && python -m pytest -q tests   # édition Flask + relais caméra
+npm install && npm run test:all                   # édition Cloudflare (API + DOM + kiosque)
 ```
 Les suites couvrent aussi les pièges déjà corrigés : cookie `Secure` rejeté en HTTP, attributs
 `style=` refusés par la CSP (graphique vide), budgets de tentatives qui punitaient les fautes
@@ -119,7 +132,7 @@ Base SQLite = suffisant pour démarrer et les premiers clients. Prévoir Postgre
 - Paiement en ligne (Stripe / CIB-Edahabia selon le marché) et limites par formule.
 - Conditions d'utilisation + politique de confidentialité (données biométriques = données sensibles, loi 18-07 en Algérie / RGPD en Europe).
 - Email de réinitialisation de mot de passe, plusieurs administrateurs par entreprise.
-- Pilotage d'une porte / tourniquet : nécessite toujours un petit boîtier sur site (Arduino/ESP32) qui interroge la plateforme.
+- Pilotage d'une porte / tourniquet : le relais sur site existe (`tools/kiosk-relay.py`, jeton d'appareil, `--on-granted`) ; il reste à le packager en image pour Raspberry Pi et à signer la partie gâche/relais avec un électricien.
 
 ---
 
