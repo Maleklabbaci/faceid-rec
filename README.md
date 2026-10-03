@@ -20,12 +20,15 @@ site/vendor/face-api.js    moteur facial navigateur (détection + empreinte 128-
 site/models/               poids des 3 réseaux (≈ 6,5 Mo, mis en cache un an)
 functions/api/[[route]].js API JSON : comptes, membres, enrôlement, reconnaissance, règles secteur, journal
 schema.sql                 schéma D1 (créé automatiquement au premier appel)
+tests/binding.test.mjs     6 tests du câblage D1 (mauvais type de liaison → message clair)
 tests/cloudflare.test.mjs  10 tests de bout en bout de l'API (npm test)
 tests/ui-flow.test.mjs     14 tests « vrai navigateur » : formulaires login/inscription,
                            session, tableau de bord, capture, kiosque (npm run test:ui)
 ```
 
-Réglages du projet Pages : *Build output directory* = `site`, base D1 `faceid` liée sous le nom **`DB`**, secret **`PEPPER`**, branche de production `main`. Détail pas à pas, dépannage de l'erreur SSL des URL de prévisualisation, domaine personnalisé : **[deploy/cloudflare-pages.md](deploy/cloudflare-pages.md)**.
+Réglages du projet Pages : *Build output directory* = `site`, base D1 `faceid` liée sous le nom **`DB`**
+(liaison **de type « D1 database »** — une simple variable `DB` ne fonctionne pas), secret **`PEPPER`**,
+branche de production `main`. Détail pas à pas, dépannage de l'erreur SSL des URL de prévisualisation, domaine personnalisé : **[deploy/cloudflare-pages.md](deploy/cloudflare-pages.md)**.
 
 ```bash
 npm install && npm run dev     # http://localhost:8788 avec une base D1 locale

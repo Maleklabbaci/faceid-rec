@@ -37,6 +37,9 @@ Dans le tableau de bord Cloudflare → **Workers & Pages** → projet **`saaspro
    - *Variable name* : **`DB`** (exactement ces deux lettres, en majuscules)
    - *D1 database* : `faceid`
    - Faire la liaison pour **Production** *et* pour **Preview**.
+   - Attention au piège classique : `DB` doit être une liaison **de type « D1 database »**, pas une
+     *variable* ni un *secret* qui s'appellerait `DB`, et pas un KV/R2. Une variable texte `DB=faceid`
+     donne une erreur `env.DB.prepare is not a function` au lieu de relier la base.
 4. **Secret de hachage des mots de passe** : **Settings → Variables and Secrets → Add**
    - Type **Secret**, nom **`PEPPER`**, valeur : une longue chaîne aléatoire (30+ caractères,
      par ex. générée avec `openssl rand -base64 32` ou un gestionnaire de mots de passe).
@@ -52,7 +55,17 @@ Ensuite ouvrez **https://saaspromax.pages.dev** → *Essai gratuit* → créez v
 Vérification rapide : `https://saaspromax.pages.dev/api/healthz` doit répondre
 `{"status":"ok","db":true,"pepper":true}`.
 
-- `"db":false` ou message « Base D1 non liée » → refaire l'étape 3 (nom `DB`) puis étape 6.
+- `{"status":"degraded","db":false,...}` → l'étape 3 est à refaire ; le champ `message` dit exactement
+  quoi. Exemples rendus par la plateforme :
+  - `"detail":"missing"` → aucune liaison `DB` (faire l'étape 3 puis l'étape 6).
+  - `"detail":"wrong-type"` avec « ce n'est pas une base D1 (reçu : une variable texte / un namespace
+    KV / un Durable Object) » → une variable **nommée** `DB` masque la liaison : la supprimer dans
+    *Variables and Secrets*, recréer l'étape 3 en **type = D1 database**, puis redéployer. Ces deux cas
+    renvoyaient avant un `500` muet (et `TypeError: env.DB.prepare is not a function` dans le journal
+    d'appels / `wrangler tail`) sur `/api/signup` comme sur tout le reste.
+- En ligne de commande, un redéploiement qui refigure la liaison :
+  `npx wrangler pages deploy site --project-name saaspromax --d1 DB=faceid`
+  (à faire depuis la branche déployée ; le dépôt passe par GitHub, donc l'étape 6 suffit en général).
 - `"pepper":false` → l'étape 4 manque (la plateforme fonctionne quand même, avec un secret par
   défaut moins sûr).
 
