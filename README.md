@@ -37,14 +37,24 @@ EMBED_PREVIEW=1 python -m web.wsgi
 ```
 Autorise l'affichage dans une iframe d'un autre site (cookies `SameSite=None; Secure`). **La caméra exige HTTPS** ; si la fenêtre intégrée bloque la caméra, la page propose un lien « Ouvrir dans un nouvel onglet ».
 
+### Les 4 cibles (secteur choisi à l'inscription, modifiable dans Paramètres)
+
+| Secteur | Cible | Vocabulaire | Règle spécifique |
+|---|---|---|---|
+| `fitness` **(cible n°1)** | Salles de sport & clubs | membres / abonnement / passages | Abonnement vérifié à chaque passage |
+| `office` | PME & bureaux (20-150 employés) | employés / contrat / pointages | Premier pointage du jour horodaté, **retard calculé** (heure de début + tolérance paramétrables), tableau « Présences du jour » |
+| `coworking` | Coworking & centres de formation | clients / accès payé / entrées | Accès selon la date payée (raccourcis Journée / 1 mois / 3 mois / 1 an), **présents aujourd'hui** |
+| `canteen` | Cantines d'entreprise & écoles privées | inscrits / inscription / repas | **Un repas par personne et par jour** (le 2ᵉ passage est refusé et annoncé), repas servis aujourd'hui |
+
+Commun à tous : même personne reconnue deux fois en moins d'une minute = un seul enregistrement ; abonnement/contrat expiré = refus journalisé ; horodatage dans le fuseau de l'entreprise (Alger par défaut).
+
 ### Fonctionnalités
-- **Espace privé par entreprise (multi-tenant)** : inscription avec nom + secteur, chaque compte ne voit que ses propres membres et passages (vérifié par tests).
-- **Secteurs** : Sport & fitness, Éducation, Coworking, Entreprises, Loisirs — l'espace change de couleurs selon le secteur, modifiable dans Paramètres.
-- **Membres & abonnements** : ajout, date de fin, statut Actif/Expiré, renouvellement, suppression (efface aussi l'historique et les données biométriques).
-- **Contrôle d'accès (kiosque)** : caméra du navigateur en mode automatique (vérification toutes les 1,5 s, bandeau vert/orange/rouge), ou entrée manuelle sans caméra. Abonnement expiré = refus journalisé ; un même membre n'est compté qu'une fois par minute ; le plus grand visage est retenu si plusieurs personnes passent devant la caméra.
-- **Journal & tableau de bord** : membres actifs, passages du jour, graphique 7 jours, derniers passages.
-- **Annonces vocales (voix féminine, gratuites)** : « Caméra activée, permission accordée », « Approchez-vous de la caméra », « Bienvenue Amine, accès autorisé », « Accès refusé, abonnement expiré »… Utilise la synthèse vocale du navigateur (voix « Google français », Hortense, Denise…) qui peut dire le prénom ; si le navigateur n'a pas de voix féminine française, des clips enregistrés (`web/static/voice/`) prennent le relais. Bouton 🔊 pour couper.
-- **Biométrie avec consentement** : l'empreinte faciale n'est enregistrée qu'après une case de consentement explicite, et peut être effacée à tout moment.
+- **Espace privé par entreprise (multi-tenant)** : chaque compte ne voit que ses propres personnes et passages (vérifié par tests).
+- **Inscription en 1 seconde** : taper le nom → « Ajouter et capturer » → la caméra s'ouvre, l'opérateur coche l'accord, compte à rebours 3-2-1, capture automatique (réessaie toute seule si personne n'est devant la caméra).
+- **Kiosque** : caméra du navigateur en mode automatique (vérification toutes les 1,5 s, bandeau vert/orange/rouge), ou validation manuelle sans caméra. Le plus grand visage est retenu si plusieurs personnes passent devant la caméra.
+- **Annonces vocales (voix féminine, gratuites)** : « Caméra activée, permission accordée », « Approchez-vous de la caméra », « Bienvenue Amine, accès autorisé », « Bonjour Karim, pointage enregistré », « Bon appétit Yanis ! », « Déjà enregistré aujourd'hui », « Accès refusé, abonnement expiré »… Synthèse vocale du navigateur (voix « Google français », Hortense, Denise…) qui dit le prénom ; si le navigateur n'a pas de voix féminine française, des clips enregistrés (`web/static/voice/`) prennent le relais. Bouton 🔊 pour couper.
+- **Journal & tableau de bord** : indicateurs propres au secteur, graphique 7 jours, journal avec heure locale, résultat (Autorisé / Refusé / Retard).
+- **Biométrie avec accord** : l'empreinte faciale n'est enregistrée qu'après une case d'accord explicite, et peut être effacée à tout moment ; supprimer une fiche efface aussi son historique.
 
 ### Sécurité incluse
 Mots de passe hachés (Werkzeug), jeton CSRF sur tous les POST, cookies `HttpOnly`/`SameSite`/`Secure`, Content-Security-Policy stricte, limitation des tentatives de connexion/inscription, aucune page privée mise en cache.

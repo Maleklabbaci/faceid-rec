@@ -7,12 +7,12 @@
     <a class="brand brand-light" href="{{ url_for('index') }}"><span class="logo">F</span> FaceID</a>
     <div class="org">
       <strong>{{ user.org_name }}</strong>
-      <span class="badge badge-sector">{{ sectors[user.sector] }}</span>
+      <span class="badge badge-sector">{{ s.label }}</span>
     </div>
     <nav class="menu">
       <a href="{{ url_for('dashboard', page='overview') }}" class="{{ 'active' if page == 'overview' }}">Tableau de bord</a>
-      <a href="{{ url_for('dashboard', page='members') }}" class="{{ 'active' if page == 'members' }}">Membres</a>
-      <a href="{{ url_for('dashboard', page='access') }}" class="{{ 'active' if page == 'access' }}">Contrôle d'accès</a>
+      <a href="{{ url_for('dashboard', page='members') }}" class="{{ 'active' if page == 'members' }}">{{ s.people|capitalize }}</a>
+      <a href="{{ url_for('dashboard', page='access') }}" class="{{ 'active' if page == 'access' }}">{{ 'Pointage' if s.rule == 'attendance' else 'Contrôle d\'accès' }}</a>
       <a href="{{ url_for('dashboard', page='settings') }}" class="{{ 'active' if page == 'settings' }}">Paramètres</a>
     </nav>
     <form method="post" action="{{ url_for('logout') }}" class="logout">
@@ -29,17 +29,66 @@
       {% endfor %}
     {% endwith %}
 
+    {% macro status_badge(end) -%}
+      {% if end >= today %}<span class="badge badge-ok">Actif</span>{% else %}<span class="badge badge-warn">Expiré</span>{% endif %}
+    {%- endmacro %}
+
+    {% macro journal(rows) %}
+      {% if rows %}
+        <table>
+          <thead><tr><th>{{ s.person|capitalize }}</th><th>Méthode</th><th>Résultat</th><th>Heure</th><th>Date</th></tr></thead>
+          <tbody>
+            {% for l in rows %}
+              <tr>
+                <td>{{ l.name }}</td>
+                <td>{{ l.method }}</td>
+                <td>
+                  {% if l.status == 'granted' %}<span class="badge badge-ok">{{ 'Pointé' if s.rule == 'attendance' else 'Autorisé' }}</span>{% else %}<span class="badge badge-warn">Refusé</span>{% endif %}
+                  {% if l.late %}<span class="badge badge-late">Retard</span>{% endif %}
+                </td>
+                <td>{{ l.local_time or '—' }}</td>
+                <td class="muted">{{ l.local_date or l.created_at[:10] }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      {% else %}
+        <p class="muted">Aucun {{ s.entry|lower }} enregistré pour le moment.</p>
+      {% endif %}
+    {% endmacro %}
+
     {% if page == 'overview' %}
-      <h1>Tableau de bord</h1>
+      <h1>Tableau de bord <span class="muted small">— {{ s.label }}</span></h1>
       <div class="stats">
-        <div class="stat"><span class="stat-label">Membres</span><span class="stat-value">{{ members|length }}</span></div>
-        <div class="stat"><span class="stat-label">Abonnements actifs</span><span class="stat-value ok">{{ active }}</span></div>
-        <div class="stat"><span class="stat-label">Expirés</span><span class="stat-value warn">{{ members|length - active }}</span></div>
-        <div class="stat"><span class="stat-label">Passages aujourd'hui</span><span class="stat-value">{{ visits }}</span></div>
-        <div class="stat"><span class="stat-label">Refus aujourd'hui</span><span class="stat-value warn">{{ refused }}</span></div>
+        {% for label, value, tone in kpis %}
+          <div class="stat"><span class="stat-label">{{ label }}</span><span class="stat-value {{ tone }}">{{ value }}</span></div>
+        {% endfor %}
       </div>
+
+      {% if s.rule == 'attendance' %}
+        <section class="card">
+          <h2>Présences du jour <span class="muted small">— début {{ user.work_start }}, tolérance {{ user.late_tolerance }} min</span></h2>
+          {% if attendance %}
+            <table>
+              <thead><tr><th>Employé</th><th>Arrivée</th><th>Statut</th></tr></thead>
+              <tbody>
+                {% for a in attendance %}
+                  <tr>
+                    <td>{{ a.name }}</td>
+                    <td>{{ a.arrival or '—' }}</td>
+                    <td>{% if a.arrival %}<span class="badge badge-ok">Présent</span>{% if a.late %} <span class="badge badge-late">En retard</span>{% endif %}{% else %}<span class="badge badge-warn">Absent</span>{% endif %}</td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          {% else %}
+            <p class="muted">Ajoutez vos employés pour suivre les présences.</p>
+          {% endif %}
+        </section>
+      {% endif %}
+
       <section class="card">
-        <h2>Passages sur 7 jours</h2>
+        <h2>{{ s.entries }} sur 7 jours</h2>
         <div class="chart">
           {% for c in chart %}
             <div class="bar-wrap">
@@ -50,45 +99,45 @@
         </div>
       </section>
       <section class="card">
-        <h2>Derniers passages</h2>
-        {% if logs %}
-          <table>
-            <thead><tr><th>Membre</th><th>Méthode</th><th>Résultat</th><th>Date (UTC)</th></tr></thead>
-            <tbody>
-              {% for l in logs[:10] %}
-                <tr><td>{{ l.name }}</td><td>{{ l.method }}</td><td>{% if l.status == 'granted' %}<span class="badge badge-ok">Autorisé</span>{% else %}<span class="badge badge-warn">Refusé</span>{% endif %}</td><td>{{ l.created_at[:16]|replace('T', ' ') }}</td></tr>
-              {% endfor %}
-            </tbody>
-          </table>
-        {% else %}
-          <p class="muted">Aucun passage enregistré pour le moment.</p>
-        {% endif %}
+        <h2>Derniers {{ s.entries|lower }}</h2>
+        {{ journal(logs[:10]) }}
       </section>
 
     {% elif page == 'members' %}
-      <h1>Membres</h1>
+      <h1>{{ s.people|capitalize }}</h1>
       <section class="card">
-        <h2>Ajouter un membre</h2>
+        <h2>Ajouter un {{ s.person }}</h2>
+        <p class="muted small">Tapez le nom, cliquez sur « Ajouter et capturer » : la personne regarde la caméra une seconde, c'est enregistré.</p>
         <form method="post" action="{{ url_for('add_member') }}" class="inline-form">
           <input type="hidden" name="csrf" value="{{ csrf }}">
-          <input name="name" required maxlength="100" placeholder="Nom complet">
+          <input name="name" required maxlength="100" placeholder="Nom complet" autofocus>
           <input type="email" name="email" maxlength="254" placeholder="Email (optionnel)">
-          <input type="date" name="subscription_end" required value="{{ today }}">
-          <button class="btn btn-primary" type="submit">Ajouter</button>
+          <span class="date-group">
+            <label class="sr-only" for="new-end">{{ s.access }} jusqu'au</label>
+            <input type="date" id="new-end" name="subscription_end" required value="{{ today }}" title="{{ s.access }} jusqu'au">
+            <span class="quick-dates" data-target="new-end">
+              <button type="button" class="chip" data-days="0">Journée</button>
+              <button type="button" class="chip" data-months="1">1 mois</button>
+              <button type="button" class="chip" data-months="3">3 mois</button>
+              <button type="button" class="chip" data-months="12">1 an</button>
+            </span>
+          </span>
+          <button class="btn btn-primary" type="submit" name="capture" value="1">📷 Ajouter et capturer</button>
+          <button class="btn btn-ghost" type="submit">Ajouter sans visage</button>
         </form>
       </section>
       <section class="card">
         <h2>Liste ({{ members|length }})</h2>
         {% if members %}
           <table>
-            <thead><tr><th>Nom</th><th>Email</th><th>Fin d'abonnement</th><th>Statut</th><th>Visage</th><th>Actions</th></tr></thead>
+            <thead><tr><th>Nom</th><th>Email</th><th>{{ s.access }} jusqu'au</th><th>Statut</th><th>Visage</th><th>Actions</th></tr></thead>
             <tbody>
               {% for m in members %}
                 <tr>
                   <td>{{ m.name }}</td>
                   <td class="muted">{{ m.email or '—' }}</td>
                   <td>{{ m.subscription_end }}</td>
-                  <td>{% if m.subscription_end >= today %}<span class="badge badge-ok">Actif</span>{% else %}<span class="badge badge-warn">Expiré</span>{% endif %}</td>
+                  <td>{{ status_badge(m.subscription_end) }}</td>
                   <td>
                     {% if m.consent_at %}
                       <span class="badge badge-info">Enregistré</span>
@@ -97,7 +146,7 @@
                         <button class="btn btn-link btn-sm" type="submit">Effacer</button>
                       </form>
                     {% else %}
-                      <button class="btn btn-ghost btn-sm js-enroll" type="button" data-member="{{ m.id }}" data-name="{{ m.name }}">Enregistrer</button>
+                      <button class="btn btn-ghost btn-sm js-enroll" type="button" data-member="{{ m.id }}" data-name="{{ m.name }}">📷 Capturer</button>
                     {% endif %}
                   </td>
                   <td class="actions">
@@ -116,29 +165,32 @@
             </tbody>
           </table>
         {% else %}
-          <p class="muted">Aucun membre. Ajoutez votre premier membre ci-dessus.</p>
+          <p class="muted">Aucun {{ s.person }}. Ajoutez le premier ci-dessus.</p>
         {% endif %}
       </section>
 
-      <dialog id="enroll-dialog" class="dialog">
-        <h2>Enregistrer le visage de <span id="enroll-name"></span></h2>
-        <p class="muted small">La personne doit être présente et donner son accord. L'empreinte faciale est stockée dans l'espace de votre entreprise uniquement et peut être effacée à tout moment.</p>
-        <div class="video-wrap"><video id="enroll-video" autoplay playsinline muted></video></div>
-        <label class="consent"><input type="checkbox" id="enroll-consent"> La personne consent à l'enregistrement de son visage pour le contrôle d'accès.</label>
+      <dialog id="enroll-dialog" class="dialog" {% if enroll_id %}data-auto-open="{{ enroll_id }}"{% endif %}>
+        <h2>Capturer le visage de <span id="enroll-name"></span></h2>
+        <p class="muted small">La personne regarde la caméra ; la capture se fait automatiquement dès que son accord est coché. L'empreinte faciale reste dans l'espace de votre entreprise et peut être effacée à tout moment.</p>
+        <div class="video-wrap">
+          <video id="enroll-video" autoplay playsinline muted></video>
+          <div id="enroll-countdown" class="countdown" hidden></div>
+        </div>
+        <label class="consent"><input type="checkbox" id="enroll-consent"> La personne est présente et a donné son accord pour l'enregistrement de son visage.</label>
         <p id="enroll-status" class="status" aria-live="polite"></p>
         <small class="muted js-voice-info"></small>
         <div class="dialog-actions">
           <button class="btn btn-ghost" type="button" id="enroll-cancel">Annuler</button>
-          <button class="btn btn-primary" type="button" id="enroll-capture" data-url-template="{{ url_for('enroll', member_id=0) }}">Capturer et enregistrer</button>
+          <button class="btn btn-primary" type="button" id="enroll-capture" data-url-template="{{ url_for('enroll', member_id=0) }}">Capturer maintenant</button>
         </div>
       </dialog>
 
     {% elif page == 'access' %}
-      <h1>Contrôle d'accès</h1>
+      <h1>{{ 'Pointage' if s.rule == 'attendance' else 'Contrôle d\'accès' }}</h1>
       <div class="two-cols">
         <section class="card kiosk">
           <h2>Reconnaissance faciale</h2>
-          <p class="muted small">Activez la caméra puis le mode automatique : chaque visage est vérifié en continu, l'abonnement contrôlé et le passage journalisé. Aucune porte n'est actionnée depuis le navigateur (boîtier sur site à venir).</p>
+          <p class="muted small">Activez la caméra puis le mode automatique : chaque visage est vérifié en continu, {{ 'le pointage est horodaté et les retards calculés' if s.rule == 'attendance' else ('un seul repas par personne et par jour' if s.rule == 'one_per_day' else 'l\'accès est contrôlé selon la date payée') }}. Aucune porte n'est actionnée depuis le navigateur (boîtier sur site à venir).</p>
           <div class="video-wrap">
             <video id="rec-video" autoplay playsinline muted></video>
             <div id="rec-banner" class="banner banner-idle" aria-live="assertive">
@@ -157,39 +209,28 @@
           <ul id="rec-live" class="live-list" aria-label="Derniers résultats"></ul>
         </section>
         <section class="card">
-          <h2>Entrée manuelle</h2>
-          <p class="muted small">Pour les sites sans caméra : sélectionnez le membre et validez son passage.</p>
+          <h2>{{ s.manual }}</h2>
+          <p class="muted small">Sans caméra : sélectionnez la personne et validez.</p>
           {% if members %}
             <ul class="member-list">
               {% for m in members %}
                 <li>
-                  <span>{{ m.name }} {% if m.subscription_end >= today %}<span class="badge badge-ok">Actif</span>{% else %}<span class="badge badge-warn">Expiré</span>{% endif %}</span>
+                  <span>{{ m.name }} {{ status_badge(m.subscription_end) }}</span>
                   <form method="post" action="{{ url_for('manual_entry', member_id=m.id) }}" class="inline">
                     <input type="hidden" name="csrf" value="{{ csrf }}">
-                    <button class="btn btn-ghost btn-sm" type="submit" {{ 'disabled' if m.subscription_end < today }}>Valider l'entrée</button>
+                    <button class="btn btn-ghost btn-sm" type="submit" {{ 'disabled' if m.subscription_end < today }}>Valider</button>
                   </form>
                 </li>
               {% endfor %}
             </ul>
           {% else %}
-            <p class="muted">Ajoutez d'abord des membres.</p>
+            <p class="muted">Ajoutez d'abord des {{ s.people }}.</p>
           {% endif %}
         </section>
       </div>
       <section class="card">
-        <h2>Journal des passages</h2>
-        {% if logs %}
-          <table>
-            <thead><tr><th>Membre</th><th>Méthode</th><th>Résultat</th><th>Date (UTC)</th></tr></thead>
-            <tbody>
-              {% for l in logs %}
-                <tr><td>{{ l.name }}</td><td>{{ l.method }}</td><td>{% if l.status == 'granted' %}<span class="badge badge-ok">Autorisé</span>{% else %}<span class="badge badge-warn">Refusé</span>{% endif %}</td><td>{{ l.created_at[:16]|replace('T', ' ') }}</td></tr>
-              {% endfor %}
-            </tbody>
-          </table>
-        {% else %}
-          <p class="muted">Aucun passage enregistré.</p>
-        {% endif %}
+        <h2>Journal des {{ s.entries|lower }}</h2>
+        {{ journal(logs) }}
       </section>
 
     {% elif page == 'settings' %}
@@ -201,22 +242,41 @@
           <label>Nom de l'entreprise
             <input name="company" required maxlength="100" value="{{ user.org_name }}">
           </label>
-          <label>Secteur d'activité (adapte les couleurs et le vocabulaire de votre espace)
+          <label>Secteur (adapte le vocabulaire, les indicateurs et les règles d'accès)
             <select name="sector">
-              {% for key, label in sectors.items() %}
-                <option value="{{ key }}" {{ 'selected' if key == user.sector }}>{{ label }}</option>
+              {% for key, sec in sectors.items() %}
+                <option value="{{ key }}" {{ 'selected' if key == user.sector }}>{{ sec.label }} — {{ sec.pitch }}</option>
               {% endfor %}
             </select>
           </label>
+          <label>Fuseau horaire (horodatage des {{ s.entries|lower }})
+            <select name="timezone">
+              {% for tz in timezones %}<option value="{{ tz }}" {{ 'selected' if tz == user.timezone }}>{{ tz }}</option>{% endfor %}
+            </select>
+          </label>
+          <fieldset class="fieldset">
+            <legend>Pointage (secteur PME & bureaux)</legend>
+            <div class="inline-form">
+              <label>Début de journée
+                <input type="time" name="work_start" value="{{ user.work_start }}" required>
+              </label>
+              <label>Tolérance (minutes)
+                <input type="number" name="late_tolerance" min="0" max="240" value="{{ user.late_tolerance }}" required>
+              </label>
+            </div>
+            <p class="muted small">Le premier pointage du jour après « début + tolérance » est compté comme retard.</p>
+          </fieldset>
           <button class="btn btn-primary" type="submit">Enregistrer</button>
         </form>
       </section>
       <section class="card">
-        <h2>Données & conformité</h2>
+        <h2>Règles actives pour « {{ s.label }} »</h2>
         <ul class="checklist">
-          <li>Chaque entreprise ne peut accéder qu'à ses propres membres et passages.</li>
-          <li>Les empreintes faciales sont enregistrées uniquement avec consentement, et effaçables depuis la page Membres.</li>
-          <li>La suppression d'un membre efface aussi son historique et ses données biométriques.</li>
+          <li>Vocabulaire : {{ s.people }}, {{ s.access|lower }}, {{ s.entries|lower }}.</li>
+          {% if s.rule == 'attendance' %}<li>Premier pointage du jour horodaté ; retard calculé selon l'heure de début et la tolérance.</li>{% endif %}
+          {% if s.rule == 'one_per_day' %}<li>Un seul repas par personne et par jour : le deuxième passage est refusé et annoncé.</li>{% endif %}
+          <li>{{ s.access }} expiré(e) = refus journalisé. Même personne reconnue deux fois en moins d'une minute = un seul enregistrement.</li>
+          <li>Chaque entreprise ne voit que ses propres données ; les empreintes faciales sont enregistrées avec accord et effaçables.</li>
         </ul>
       </section>
     {% endif %}

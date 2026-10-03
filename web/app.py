@@ -10,23 +10,50 @@ from collections import defaultdict, deque
 from datetime import date, datetime, timedelta, timezone
 from functools import wraps
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from flask import Flask, abort, flash, g, jsonify, make_response, redirect, render_template, request, session, url_for
 from PIL import Image, UnidentifiedImageError
 from werkzeug.security import check_password_hash, generate_password_hash
 
-SECTORS = {"fitness": "Sport & fitness", "education": "Éducation", "coworking": "Coworking", "enterprise": "Entreprises", "leisure": "Loisirs"}
+# One platform, four target segments. Each sector drives vocabulary, KPIs and access rules.
+SECTORS = {
+    "fitness": {"label": "Salles de sport & fitness", "short": "Sport", "person": "membre", "people": "membres", "access": "Abonnement", "entry": "Passage", "entries": "Passages", "manual": "Passage manuel", "rule": None,
+                "pitch": "Fini les cartes prêtées aux amis : le membre entre avec son visage."},
+    "office": {"label": "PME & bureaux", "short": "Bureau", "person": "employé", "people": "employés", "access": "Contrat", "entry": "Pointage", "entries": "Pointages", "manual": "Pointage manuel", "rule": "attendance",
+               "pitch": "Pointage quotidien automatique, calcul des retards, zéro triche entre collègues."},
+    "coworking": {"label": "Coworking & centres de formation", "short": "Coworking", "person": "client", "people": "clients", "access": "Accès payé", "entry": "Entrée", "entries": "Entrées", "manual": "Entrée manuelle", "rule": None,
+                  "pitch": "Accès selon le temps payé et nombre exact de personnes présentes."},
+    "canteen": {"label": "Cantines & écoles privées", "short": "Cantine", "person": "inscrit", "people": "inscrits", "access": "Inscription", "entry": "Repas", "entries": "Repas", "manual": "Repas manuel", "rule": "one_per_day",
+                "pitch": "Un repas par personne et par jour, présences instantanées."},
+}
+LEGACY_SECTORS = {"education": "canteen", "enterprise": "office", "leisure": "fitness"}
+TIMEZONES = ["Africa/Algiers", "Africa/Casablanca", "Africa/Tunis", "Africa/Cairo", "Africa/Lagos", "Europe/Paris", "Asia/Dubai", "UTC"]
 TOLERANCE = 0.5          # same threshold as the desktop app
 MIN_FACE_HEIGHT = 50     # pixels, on a 640px-wide frame: rejects faces too far from the camera
 DUPLICATE_WINDOW = 60    # seconds: one logged entry per member within this window
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS organizations(id INTEGER PRIMARY KEY, name TEXT NOT NULL, sector TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS organizations(id INTEGER PRIMARY KEY, name TEXT NOT NULL, sector TEXT NOT NULL, timezone TEXT NOT NULL DEFAULT 'Africa/Algiers', work_start TEXT NOT NULL DEFAULT '08:30', late_tolerance INTEGER NOT NULL DEFAULT 10);
 CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL REFERENCES organizations(id), email TEXT UNIQUE NOT NULL, password TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS members(id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL REFERENCES organizations(id), name TEXT NOT NULL, email TEXT NOT NULL DEFAULT '', subscription_end TEXT NOT NULL, encoding TEXT, consent_at TEXT, UNIQUE(org_id,id));
-CREATE TABLE IF NOT EXISTS entries(id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL, member_id INTEGER NOT NULL, actor_id INTEGER NOT NULL REFERENCES users(id), created_at TEXT NOT NULL, method TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'granted', FOREIGN KEY(org_id,member_id) REFERENCES members(org_id,id) ON DELETE CASCADE);
+CREATE TABLE IF NOT EXISTS entries(id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL, member_id INTEGER NOT NULL, actor_id INTEGER NOT NULL REFERENCES users(id), created_at TEXT NOT NULL, method TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'granted', local_date TEXT, local_time TEXT, late INTEGER NOT NULL DEFAULT 0, FOREIGN KEY(org_id,member_id) REFERENCES members(org_id,id) ON DELETE CASCADE);
+"""
+INDEXES = """
 CREATE INDEX IF NOT EXISTS members_org ON members(org_id);
 CREATE INDEX IF NOT EXISTS entries_org ON entries(org_id);
+CREATE INDEX IF NOT EXISTS entries_day ON entries(org_id, local_date);
 """
+MIGRATIONS = {
+    "organizations": {"timezone": "TEXT NOT NULL DEFAULT 'Africa/Algiers'", "work_start": "TEXT NOT NULL DEFAULT '08:30'", "late_tolerance": "INTEGER NOT NULL DEFAULT 10"},
+    "entries": {"status": "TEXT NOT NULL DEFAULT 'granted'", "local_date": "TEXT", "local_time": "TEXT", "late": "INTEGER NOT NULL DEFAULT 0"},
+}
+
+
+def tz_of(name):
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError, TypeError):
+        return timezone.utc
 
 
 def create_app(config=None):
@@ -68,8 +95,18 @@ def create_app(config=None):
     with app.app_context():
         db().execute("PRAGMA journal_mode=WAL")
         db().executescript(SCHEMA)
-        if "status" not in [r[1] for r in db().execute("PRAGMA table_info(entries)")]:
-            db().execute("ALTER TABLE entries ADD COLUMN status TEXT NOT NULL DEFAULT 'granted'")
+        for table, columns in MIGRATIONS.items():
+            existing = [r[1] for r in db().execute(f"PRAGMA table_info({table})")]
+            for column, definition in columns.items():
+                if column not in existing:
+                    db().execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        db().executescript(INDEXES)  # after migrations: indexes may reference added columns
+        for old, new in LEGACY_SECTORS.items():
+            db().execute("UPDATE organizations SET sector=? WHERE sector=?", (new, old))
+        # Backfill local date/time for entries created before timezone support.
+        for row in db().execute("SELECT entries.id, entries.created_at, organizations.timezone FROM entries JOIN organizations ON organizations.id=entries.org_id WHERE local_date IS NULL").fetchall():
+            local = datetime.fromisoformat(row["created_at"]).astimezone(tz_of(row["timezone"]))
+            db().execute("UPDATE entries SET local_date=?, local_time=? WHERE id=?", (local.date().isoformat(), local.strftime("%H:%M"), row["id"]))
         db().commit()
 
     @app.teardown_appcontext
@@ -80,8 +117,11 @@ def create_app(config=None):
     @app.before_request
     def protect():
         g.user = None
+        g.sector = None
         if session.get("user_id"):
-            g.user = db().execute("SELECT users.*, organizations.name AS org_name, organizations.sector FROM users JOIN organizations ON organizations.id=users.org_id WHERE users.id=?", (session["user_id"],)).fetchone()
+            g.user = db().execute("SELECT users.*, organizations.name AS org_name, organizations.sector, organizations.timezone, organizations.work_start, organizations.late_tolerance FROM users JOIN organizations ON organizations.id=users.org_id WHERE users.id=?", (session["user_id"],)).fetchone()
+            if g.user:
+                g.sector = SECTORS.get(g.user["sector"], SECTORS["fitness"])
         if "csrf" not in session:
             session["csrf"] = secrets.token_hex(32)
         if request.method == "POST":
@@ -104,7 +144,7 @@ def create_app(config=None):
 
     @app.context_processor
     def context():
-        return {"csrf": session.get("csrf"), "user": g.user, "sectors": SECTORS}
+        return {"csrf": session.get("csrf"), "user": g.user, "sectors": SECTORS, "s": g.sector, "timezones": TIMEZONES}
 
     def limited(bucket, count, seconds=60):
         # Single-process MVP protection. Use shared Redis limits for production.
@@ -142,18 +182,43 @@ def create_app(config=None):
     def api_fail(code, status, message, **extra):
         abort(make_response(jsonify(status=status, message=message, **extra), code))
 
+    def now_local():
+        return datetime.now(tz_of(g.user["timezone"]))
+
+    def today():
+        return now_local().date().isoformat()
+
     def record(row, method):
-        """Log an access attempt for a member. Returns (granted, duplicate)."""
-        granted = row["subscription_end"] >= date.today().isoformat()
-        now = datetime.now(timezone.utc)
-        duplicate = False
-        if granted:
-            since = (now - timedelta(seconds=DUPLICATE_WINDOW)).isoformat()
-            duplicate = db().execute("SELECT 1 FROM entries WHERE org_id=? AND member_id=? AND status='granted' AND created_at>=?", (g.user["org_id"], row["id"], since)).fetchone() is not None
-        if not duplicate:
-            db().execute("INSERT INTO entries(org_id,member_id,actor_id,created_at,method,status) VALUES(?,?,?,?,?,?)", (g.user["org_id"], row["id"], g.user["id"], now.isoformat(), method, "granted" if granted else "refused"))
-            db().commit()
-        return granted, duplicate
+        """Apply the sector's access rules and log the attempt.
+
+        Returns a dict: granted, duplicate (same person within DUPLICATE_WINDOW),
+        already (sector allows one entry per day and it was used), late, local_time.
+        """
+        local = now_local()
+        day, hhmm = local.date().isoformat(), local.strftime("%H:%M")
+        result = {"granted": row["subscription_end"] >= day, "duplicate": False, "already": False, "late": False, "local_time": hhmm, "late_minutes": 0}
+        if not result["granted"]:
+            status = "refused"
+        else:
+            now_utc = datetime.now(timezone.utc)
+            since = (now_utc - timedelta(seconds=DUPLICATE_WINDOW)).isoformat()
+            result["duplicate"] = db().execute("SELECT 1 FROM entries WHERE org_id=? AND member_id=? AND status='granted' AND created_at>=?", (g.user["org_id"], row["id"], since)).fetchone() is not None
+            if result["duplicate"]:
+                return result
+            first_today = db().execute("SELECT 1 FROM entries WHERE org_id=? AND member_id=? AND status='granted' AND local_date=?", (g.user["org_id"], row["id"], day)).fetchone() is None
+            if g.sector["rule"] == "one_per_day" and not first_today:
+                result["already"] = True
+                return result
+            if g.sector["rule"] == "attendance" and first_today:
+                h, m = (int(x) for x in (g.user["work_start"] or "08:30").split(":"))
+                limit = local.replace(hour=h, minute=m, second=0, microsecond=0) + timedelta(minutes=g.user["late_tolerance"] or 0)
+                if local > limit:
+                    result["late"] = True
+                    result["late_minutes"] = int((local - limit).total_seconds() // 60) + 1
+            status = "granted"
+        db().execute("INSERT INTO entries(org_id,member_id,actor_id,created_at,method,status,local_date,local_time,late) VALUES(?,?,?,?,?,?,?,?,?)", (g.user["org_id"], row["id"], g.user["id"], datetime.now(timezone.utc).isoformat(), method, status, day, hhmm, int(result["late"])))
+        db().commit()
+        return result
 
     @app.get("/")
     def index():
@@ -180,7 +245,7 @@ def create_app(config=None):
                 except sqlite3.IntegrityError:
                     db().rollback()
                     flash("Impossible de créer ce compte avec ces informations. Essayez de vous connecter.", "error")
-        return render_template("auth.html", signup=True)
+        return render_template("auth.html", signup=True, selected=request.args.get("sector", "fitness"))
 
     @app.route("/login", methods=["GET", "POST"])
     def login():
@@ -207,17 +272,36 @@ def create_app(config=None):
     def dashboard(page="overview"):
         if page not in ("overview", "members", "access", "settings"):
             abort(404)
-        org = g.user["org_id"]
+        org, day = g.user["org_id"], today()
         rows = db().execute("SELECT id,name,email,subscription_end,consent_at FROM members WHERE org_id=? ORDER BY id DESC", (org,)).fetchall()
         logs = db().execute("SELECT entries.*,members.name FROM entries JOIN members ON members.id=entries.member_id AND members.org_id=entries.org_id WHERE entries.org_id=? ORDER BY entries.id DESC LIMIT 30", (org,)).fetchall()
-        today = date.today().isoformat()
-        active = sum(r["subscription_end"] >= today for r in rows)
+        active = sum(r["subscription_end"] >= day for r in rows)
 
-        def count(status, day):
-            return db().execute("SELECT COUNT(*) FROM entries WHERE org_id=? AND status=? AND substr(created_at,1,10)=?", (org, status, day)).fetchone()[0]
+        def count(sql, *params):
+            return db().execute(sql, (org, *params)).fetchone()[0]
 
-        chart = [{"day": (date.today() - timedelta(days=o)).isoformat()[5:], "count": count("granted", (date.today() - timedelta(days=o)).isoformat())} for o in range(6, -1, -1)]
-        return render_template("dashboard.html", page=page, members=rows, logs=logs, active=active, visits=count("granted", today), refused=count("refused", today), today=today, chart=chart, chart_max=max([c["count"] for c in chart] + [1]))
+        entries_today = count("SELECT COUNT(*) FROM entries WHERE org_id=? AND status='granted' AND local_date=?", day)
+        refused_today = count("SELECT COUNT(*) FROM entries WHERE org_id=? AND status='refused' AND local_date=?", day)
+        present_today = count("SELECT COUNT(DISTINCT member_id) FROM entries WHERE org_id=? AND status='granted' AND local_date=?", day)
+        late_today = count("SELECT COUNT(*) FROM entries WHERE org_id=? AND late=1 AND local_date=?", day)
+        s = g.sector
+        if s["rule"] == "attendance":
+            kpis = [("Employés", len(rows), ""), ("Présents aujourd'hui", present_today, "ok"), ("Absents", max(active - present_today, 0), "warn"), ("Retards aujourd'hui", late_today, "warn"), ("Pointages aujourd'hui", entries_today, "")]
+        elif s["rule"] == "one_per_day":
+            kpis = [("Inscrits", len(rows), ""), ("Repas servis aujourd'hui", entries_today, "ok"), ("Inscriptions actives", active, ""), ("Expirées", len(rows) - active, "warn"), ("Refus aujourd'hui", refused_today, "warn")]
+        elif s["short"] == "Coworking":
+            kpis = [("Clients", len(rows), ""), ("Présents aujourd'hui", present_today, "ok"), ("Accès actifs", active, ""), ("Expirés", len(rows) - active, "warn"), ("Refus aujourd'hui", refused_today, "warn")]
+        else:
+            kpis = [("Membres", len(rows), ""), ("Abonnements actifs", active, "ok"), ("Expirés", len(rows) - active, "warn"), ("Passages aujourd'hui", entries_today, ""), ("Refus aujourd'hui", refused_today, "warn")]
+        attendance = []
+        if s["rule"] == "attendance":
+            first = {r["member_id"]: r for r in db().execute("SELECT member_id, MIN(local_time) AS arrival, MAX(late) AS late FROM entries WHERE org_id=? AND status='granted' AND local_date=? GROUP BY member_id", (org, day)).fetchall()}
+            attendance = sorted(({"name": m["name"], "arrival": first[m["id"]]["arrival"] if m["id"] in first else None, "late": bool(first[m["id"]]["late"]) if m["id"] in first else False} for m in rows if m["subscription_end"] >= day), key=lambda a: (a["arrival"] is None, a["arrival"] or "", a["name"]))
+        chart = []
+        for offset in range(6, -1, -1):
+            d = (now_local().date() - timedelta(days=offset)).isoformat()
+            chart.append({"day": d[5:], "count": count("SELECT COUNT(*) FROM entries WHERE org_id=? AND status='granted' AND local_date=?", d)})
+        return render_template("dashboard.html", page=page, members=rows, logs=logs, kpis=kpis, attendance=attendance, today=day, chart=chart, chart_max=max([c["count"] for c in chart] + [1]), enroll_id=request.args.get("enroll", type=int))
 
     @app.post("/members")
     @auth
@@ -227,9 +311,11 @@ def create_app(config=None):
         if not name or len(name) > 100 or len(email) > 254:
             abort(400, "Nom requis (100 caractères maximum).")
         end = valid_date(request.form.get("subscription_end"))
-        db().execute("INSERT INTO members(org_id,name,email,subscription_end) VALUES(?,?,?,?)", (g.user["org_id"], name, email, end))
+        new_id = db().execute("INSERT INTO members(org_id,name,email,subscription_end) VALUES(?,?,?,?)", (g.user["org_id"], name, email, end)).lastrowid
         db().commit()
-        flash("Membre ajouté à votre espace.", "success")
+        if request.form.get("capture"):
+            return redirect(url_for("dashboard", page="members", enroll=new_id))
+        flash(f"{name} ajouté(e) à votre espace.", "success")
         return redirect(url_for("dashboard", page="members"))
 
     @app.post("/members/<int:member_id>/renew")
@@ -239,7 +325,7 @@ def create_app(config=None):
         end = valid_date(request.form.get("subscription_end"))
         db().execute("UPDATE members SET subscription_end=? WHERE id=? AND org_id=?", (end, member_id, g.user["org_id"]))
         db().commit()
-        flash("Abonnement mis à jour.", "success")
+        flash(f"{g.sector['access']} mis à jour.", "success")
         return redirect(url_for("dashboard", page="members"))
 
     @app.post("/members/<int:member_id>/delete")
@@ -248,17 +334,22 @@ def create_app(config=None):
         member(member_id)
         db().execute("DELETE FROM members WHERE id=? AND org_id=?", (member_id, g.user["org_id"]))
         db().commit()
-        flash("Membre, données biométriques et historique associé supprimés.", "success")
+        flash("Fiche, données biométriques et historique associé supprimés.", "success")
         return redirect(url_for("dashboard", page="members"))
 
     @app.post("/members/<int:member_id>/entry")
     @auth
     def manual_entry(member_id):
         row = member(member_id)
-        if row["subscription_end"] < date.today().isoformat():
-            abort(409, "Abonnement expiré : entrée refusée.")
-        _, duplicate = record(row, "Manuel")
-        flash("Entrée déjà enregistrée il y a moins d’une minute." if duplicate else "Entrée enregistrée par l’administrateur.", "success")
+        if row["subscription_end"] < today():
+            abort(409, f"{g.sector['access']} expiré(e) : refus.")
+        result = record(row, "Manuel")
+        if result["already"]:
+            flash(f"{row['name']} : déjà enregistré(e) aujourd'hui (règle « un {g.sector['entry'].lower()} par jour »).", "error")
+        elif result["duplicate"]:
+            flash(f"{row['name']} : déjà enregistré(e) il y a moins d'une minute.", "success")
+        else:
+            flash(f"{g.sector['entry']} enregistré pour {row['name']} à {result['local_time']}" + (f" (retard de {result['late_minutes']} min)" if result["late"] else "") + ".", "success")
         return redirect(url_for("dashboard", page="access"))
 
     @app.post("/members/<int:member_id>/consent/revoke")
@@ -275,9 +366,16 @@ def create_app(config=None):
     def settings():
         name = request.form.get("company", "").strip()
         sector = request.form.get("sector")
-        if not name or len(name) > 100 or sector not in SECTORS:
+        tz = request.form.get("timezone", "Africa/Algiers")
+        work_start = request.form.get("work_start", "08:30")
+        try:
+            datetime.strptime(work_start, "%H:%M")
+            tolerance = max(0, min(int(request.form.get("late_tolerance", 10)), 240))
+        except ValueError:
+            abort(400, "Heure ou tolérance invalide.")
+        if not name or len(name) > 100 or sector not in SECTORS or tz not in TIMEZONES:
             abort(400)
-        db().execute("UPDATE organizations SET name=?,sector=? WHERE id=?", (name, sector, g.user["org_id"]))
+        db().execute("UPDATE organizations SET name=?,sector=?,timezone=?,work_start=?,late_tolerance=? WHERE id=?", (name, sector, tz, work_start, tolerance, g.user["org_id"]))
         db().commit()
         flash("Votre espace a été personnalisé.", "success")
         return redirect(url_for("dashboard", page="settings"))
@@ -317,7 +415,7 @@ def create_app(config=None):
         row = member(member_id)
         if (request.get_json(silent=True) or {}).get("consent") is not True:
             api_fail(400, "error", "Consentement explicite requis.")
-        limited("enroll", 20)
+        limited("enroll", 30)
         encoding, _, _ = detect_face(single=True)
         db().execute("UPDATE members SET encoding=?,consent_at=? WHERE id=? AND org_id=?", (json.dumps(encoding.tolist()), datetime.now(timezone.utc).isoformat(), member_id, g.user["org_id"]))
         db().commit()
@@ -330,17 +428,27 @@ def create_app(config=None):
         encoding, engine, np = detect_face(single=False)
         rows = db().execute("SELECT * FROM members WHERE org_id=? AND encoding IS NOT NULL AND consent_at IS NOT NULL", (g.user["org_id"],)).fetchall()
         if not rows:
-            api_fail(404, "unknown", "Aucun visage enregistré dans votre espace : enregistrez d’abord vos membres (page Membres).")
+            api_fail(404, "unknown", f"Aucun visage enregistré dans votre espace : enregistrez d’abord vos {g.sector['people']} (page {g.sector['people'].capitalize()}).")
         distances = engine.face_distance([np.array(json.loads(r["encoding"])) for r in rows], encoding)
         idx = int(np.argmin(distances))
         if distances[idx] > TOLERANCE:
             api_fail(404, "unknown", "Visage non reconnu : accès refusé.")
         row = rows[idx]
-        granted, duplicate = record(row, "Facial")
-        if not granted:
-            api_fail(403, "expired", f"{row['name']} : abonnement expiré le {row['subscription_end']}, accès refusé.", name=row["name"])
-        suffix = " (passage déjà enregistré)" if duplicate else ""
-        return jsonify(status="granted", name=row["name"], message=f"{row['name']} : accès autorisé{suffix}.", confidence=round(float(1 - distances[idx]), 2))
+        name, s = row["name"], g.sector
+        result = record(row, "Facial")
+        if not result["granted"]:
+            api_fail(403, "expired", f"{name} : {s['access'].lower()} expiré(e) le {row['subscription_end']}, accès refusé.", name=name)
+        if result["already"]:
+            api_fail(409, "already", f"{name} : {s['entry'].lower()} déjà enregistré aujourd'hui.", name=name)
+        if s["rule"] == "attendance":
+            message = f"{name} : pointage enregistré à {result['local_time']}" + (f" — retard de {result['late_minutes']} min" if result["late"] else "") + "."
+        elif s["rule"] == "one_per_day":
+            message = f"{name} : repas enregistré. Bon appétit !"
+        else:
+            message = f"{name} : accès autorisé."
+        if result["duplicate"]:
+            message = f"{name} : déjà enregistré(e) il y a moins d'une minute."
+        return jsonify(status="granted", name=name, message=message, late=result["late"], local_time=result["local_time"], confidence=round(float(1 - distances[idx]), 2))
 
     @app.errorhandler(400)
     @app.errorhandler(401)

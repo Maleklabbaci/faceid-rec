@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}FaceID Platform — Contrôle d'accès par abonnement, pour tous les secteurs{% endblock %}
+{% block title %}FaceID Platform — Contrôle d'accès et pointage par reconnaissance faciale{% endblock %}
 {% block body_class %}landing{% endblock %}
 {% block body %}
 <header class="topbar">
@@ -15,47 +15,71 @@
 </header>
 
 <section class="hero">
-  <p class="eyebrow">Plateforme SaaS multi-entreprises</p>
-  <h1>Le contrôle d'accès par abonnement,<br>prêt pour votre secteur.</h1>
-  <p class="lead">Gérez vos membres, vos abonnements et vos entrées depuis un simple navigateur. Chaque entreprise dispose de son espace isolé et sécurisé.</p>
+  <p class="eyebrow">Plateforme web — aucun badge, aucune carte, aucun matériel spécial</p>
+  <h1>Vos membres et employés entrent<br>avec leur visage.</h1>
+  <p class="lead">Une webcam, un navigateur, une seconde : la personne est reconnue, son abonnement ou son contrat vérifié, son passage enregistré. Chaque entreprise dispose de son espace privé.</p>
   <div class="hero-actions">
-    <a class="btn btn-primary btn-lg" href="{{ url_for('signup') }}">Créer mon espace</a>
-    <a class="btn btn-ghost btn-lg" href="#secteurs">Voir les secteurs</a>
+    <a class="btn btn-primary btn-lg" href="{{ url_for('signup') }}">Créer mon espace gratuit</a>
+    <a class="btn btn-ghost btn-lg" href="#secteurs">Voir les cas d'usage</a>
   </div>
+  <ul class="hero-points">
+    <li>✔ Inscription en 1 seconde : nom → capturer → terminé</li>
+    <li>✔ Voix qui annonce « Accès autorisé » / « Accès refusé »</li>
+    <li>✔ Journal complet, tableau de bord, exports à venir</li>
+  </ul>
 </section>
 
 <section id="secteurs" class="sectors">
-  <h2>Une seule plateforme, plusieurs métiers</h2>
-  <div class="grid">
-    <article class="card"><h3>🏋️ Sport & fitness</h3><p>Salles de sport, piscines, clubs : abonnements mensuels, accès aux heures d'ouverture, relances d'expiration.</p></article>
-    <article class="card"><h3>🎓 Éducation</h3><p>Écoles privées, centres de formation : présence des élèves et des formateurs, cartes d'accès remplacées par le visage.</p></article>
-    <article class="card"><h3>💼 Coworking</h3><p>Espaces partagés : forfaits journaliers ou mensuels, accès des membres et de leurs invités.</p></article>
-    <article class="card"><h3>🏢 Entreprises</h3><p>Bureaux, entrepôts : badge virtuel pour les employés et prestataires, journal des entrées.</p></article>
-    <article class="card"><h3>🎮 Loisirs</h3><p>Salles de jeux, clubs privés : contrôle de l'abonnement à l'entrée, en quelques secondes.</p></article>
+  <h2>Quatre métiers, une seule plateforme</h2>
+  <div class="grid cases">
+    <article class="card case primary">
+      <span class="badge badge-ok">Cible principale</span>
+      <h3>🏋️ Salles de sport & clubs de fitness</h3>
+      <p><strong>Le cas :</strong> le gérant crée le membre à l'inscription en tapant son nom, clique sur <em>Capturer</em>, le membre regarde la caméra une seconde, c'est enregistré.</p>
+      <p><strong>Le gain :</strong> fini les cartes et badges prêtés aux amis. Le membre entre juste avec son visage, l'abonnement est vérifié à chaque passage.</p>
+      <a class="btn btn-primary btn-sm" href="{{ url_for('signup', sector='fitness') }}">Démarrer pour ma salle</a>
+    </article>
+    <article class="card case">
+      <h3>🏢 PME & bureaux (20 à 150 employés)</h3>
+      <p><strong>Le cas :</strong> le responsable RH ajoute le nouvel employé sur l'application web le premier jour, il regarde la webcam une seconde.</p>
+      <p><strong>Le gain :</strong> pointage quotidien automatique, calcul des retards et suppression totale de la triche entre collègues (<em>buddy punching</em>).</p>
+      <a class="btn btn-ghost btn-sm" href="{{ url_for('signup', sector='office') }}">Démarrer pour mon entreprise</a>
+    </article>
+    <article class="card case">
+      <h3>💼 Coworking & centres de formation</h3>
+      <p><strong>Le cas :</strong> à la réception, quand le client paie sa journée ou sa session, l'agent tape son nom et fait le scan rapide.</p>
+      <p><strong>Le gain :</strong> accès contrôlé selon le temps payé et suivi exact du nombre de personnes présentes.</p>
+      <a class="btn btn-ghost btn-sm" href="{{ url_for('signup', sector='coworking') }}">Démarrer pour mon espace</a>
+    </article>
+    <article class="card case">
+      <h3>🍽️ Cantines d'entreprise & écoles privées</h3>
+      <p><strong>Le cas :</strong> l'administration enregistre l'élève ou l'employé en début d'année ou à l'embauche.</p>
+      <p><strong>Le gain :</strong> comptage des repas pris dans la journée (un seul par personne) et gestion des présences instantanée.</p>
+      <a class="btn btn-ghost btn-sm" href="{{ url_for('signup', sector='canteen') }}">Démarrer pour ma cantine</a>
+    </article>
   </div>
 </section>
 
 <section class="features">
-  <h2>Ce que vous obtenez</h2>
-  <div class="grid">
-    <article class="card"><h3>Espace privé par entreprise</h3><p>Vos données ne sont jamais mêlées à celles d'une autre société. Chaque compte ne voit que son propre espace.</p></article>
-    <article class="card"><h3>Abonnements & renouvellements</h3><p>Dates de fin, statut actif/expiré, renouvellement en un clic, historique des passages.</p></article>
-    <article class="card"><h3>Reconnaissance faciale en option</h3><p>Activée uniquement avec le consentement explicite de la personne, effaçable à tout moment.</p></article>
-    <article class="card"><h3>Tableau de bord</h3><p>Membres actifs, passages du jour, tendance sur 7 jours : l'essentiel pour piloter votre activité.</p></article>
+  <h2>Comment ça marche</h2>
+  <div class="grid steps">
+    <article class="card"><span class="step">1</span><h3>Créez votre espace</h3><p>Nom de l'entreprise, secteur, email : votre espace privé est prêt en 30 secondes, sans carte bancaire.</p></article>
+    <article class="card"><span class="step">2</span><h3>Enregistrez les visages</h3><p>Tapez le nom, cliquez sur Capturer : la personne regarde la webcam une seconde. Son accord est recueilli, ses données effaçables à tout moment.</p></article>
+    <article class="card"><span class="step">3</span><h3>Laissez le kiosque tourner</h3><p>Un PC ou une tablette à l'entrée, mode automatique activé : la voix annonce le résultat, le journal se remplit tout seul.</p></article>
   </div>
 </section>
 
 <section class="pricing">
   <h2>Tarifs indicatifs</h2>
   <div class="grid">
-    <article class="card plan"><h3>Starter</h3><p class="price">Gratuit</p><ul><li>Jusqu'à 25 membres</li><li>Gestion manuelle des entrées</li><li>1 administrateur</li></ul><a class="btn btn-ghost" href="{{ url_for('signup') }}">Commencer</a></article>
-    <article class="card plan highlight"><h3>Pro</h3><p class="price">À définir</p><ul><li>Membres illimités</li><li>Reconnaissance faciale</li><li>Historique complet</li></ul><a class="btn btn-primary" href="{{ url_for('signup') }}">Essayer</a></article>
-    <article class="card plan"><h3>Entreprise</h3><p class="price">Sur devis</p><ul><li>Plusieurs sites</li><li>Intégration porte / tourniquet</li><li>Support dédié</li></ul><a class="btn btn-ghost" href="{{ url_for('signup') }}">Nous contacter</a></article>
+    <article class="card plan"><h3>Starter</h3><p class="price">Gratuit</p><ul><li>Jusqu'à 25 personnes</li><li>Reconnaissance faciale incluse</li><li>1 administrateur</li></ul><a class="btn btn-ghost" href="{{ url_for('signup') }}">Commencer</a></article>
+    <article class="card plan highlight"><h3>Pro</h3><p class="price">À définir</p><ul><li>Personnes illimitées</li><li>Pointage, retards, repas</li><li>Historique complet & exports</li></ul><a class="btn btn-primary" href="{{ url_for('signup') }}">Essayer</a></article>
+    <article class="card plan"><h3>Entreprise</h3><p class="price">Sur devis</p><ul><li>Plusieurs sites</li><li>Boîtier porte / tourniquet</li><li>Support dédié</li></ul><a class="btn btn-ghost" href="{{ url_for('signup') }}">Nous contacter</a></article>
   </div>
   <p class="muted small">Le paiement en ligne n'est pas encore activé : les tarifs sont présentés à titre indicatif.</p>
 </section>
 
 <footer class="footer">
-  <p>© FaceID Platform — Données biométriques traitées uniquement avec consentement, supprimables à tout moment.</p>
+  <p>© FaceID Platform — Données biométriques traitées uniquement avec accord de la personne, supprimables à tout moment.</p>
 </footer>
 {% endblock %}

@@ -19,8 +19,8 @@
         </label>
         <label>Secteur d'activité
           <select name="sector" required>
-            {% for key, label in sectors.items() %}
-              <option value="{{ key }}">{{ label }}</option>
+            {% for key, sec in sectors.items() %}
+              <option value="{{ key }}" {{ 'selected' if key == selected }}>{{ sec.label }}</option>
             {% endfor %}
           </select>
         </label>

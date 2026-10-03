@@ -10,9 +10,18 @@
   // the kiosk can greet members by name. Otherwise, recorded female clips
   // served from /static/voice are used for the fixed phrases.
   const VOICE_BASE = document.body.dataset.voiceBase || "/static/voice/";
+  const sector = (document.body.className.match(/sector-(\w+)/) || [])[1] || "fitness";
+  const GRANTED = {
+    fitness: (n) => (n ? "Bienvenue " + n + ". Accès autorisé." : "Accès autorisé. Bienvenue !"),
+    coworking: (n) => (n ? "Bienvenue " + n + ". Accès autorisé." : "Accès autorisé. Bienvenue !"),
+    office: (n) => (n ? "Bonjour " + n + ". Pointage enregistré." : "Pointage enregistré. Bonne journée."),
+    canteen: (n) => (n ? "Bon appétit " + n + " !" : "Repas enregistré. Bon appétit !"),
+  };
+  const EXPIRED_WORD = { fitness: "abonnement", coworking: "accès payé", office: "contrat", canteen: "inscription" };
   const PHRASES = {
-    granted: (n) => (n ? "Bienvenue " + n + ". Accès autorisé." : "Accès autorisé. Bienvenue !"),
-    expired: (n) => "Accès refusé. " + (n ? n + ", votre" : "Votre") + " abonnement est expiré. Merci de passer à l'accueil.",
+    granted: (n) => (GRANTED[sector] || GRANTED.fitness)(n),
+    already: (n) => (n ? n + ", déjà enregistré aujourd'hui. Merci." : "Déjà enregistré aujourd'hui. Merci."),
+    expired: (n) => "Accès refusé. " + (n ? n + ", votre " : "Votre ") + (EXPIRED_WORD[sector] || "abonnement") + " est expiré. Merci de passer à l'accueil.",
     unknown: () => "Accès refusé. Visage non reconnu.",
     far: () => "Approchez-vous de la caméra, s'il vous plaît.",
     none: () => "Placez-vous face à la caméra.",
@@ -25,7 +34,8 @@
     enrolled: () => "Visage enregistré avec succès.",
     voice_on: () => "Annonces vocales activées.",
   };
-  const CLIPS = ["granted", "expired", "unknown", "far", "none", "multi", "camera_on", "camera_denied", "auto_on", "enrolled"];
+  const CLIPS = ["granted", "already", "expired", "unknown", "far", "none", "multi", "camera_on", "camera_denied", "auto_on", "enrolled", "pointage", "meal"];
+  const CLIP_FOR = { granted: { office: "pointage", canteen: "meal" } }; // sector-specific recorded clips
   // Known female French voices, by preference (Chrome, Edge, Windows, macOS, iOS).
   const FEMALE_VOICES = ["google français", "denise", "hortense", "julie", "audrey", "amélie", "amelie", "vivienne", "eloise", "éloise", "aurélie", "aurelie", "charlotte", "marie", "pauline", "sylvie", "céline", "celine", "chantal", "virginie", "léa", "coralie", "jacqueline", "brigitte", "female", "femme"];
   const HINTS = ["far", "none", "multi"]; // low-priority: never interrupt a running announcement
@@ -82,8 +92,9 @@
       u.onend = u.onerror = () => { ttsBusyUntil = 0; };
       speechSynthesis.speak(u);
     } else if (CLIPS.includes(key)) {
+      const clip = (CLIP_FOR[key] && CLIP_FOR[key][sector]) || key;
       clipPlayer.pause();
-      clipPlayer.src = VOICE_BASE + key + ".mp3";
+      clipPlayer.src = VOICE_BASE + clip + ".mp3";
       clipPlayer.currentTime = 0;
       clipPlayer.play().catch(() => { /* needs a prior click on the page */ });
     }
@@ -92,6 +103,7 @@
   function speakResult(result) {
     const gap = 8000; // do not repeat the same announcement for the same person within 8 s
     if (result.status === "granted") speak("granted", result.name, gap);
+    else if (result.status === "already") speak("already", result.name, gap);
     else if (result.status === "expired") speak("expired", result.name, gap);
     else if (result.status === "unknown") speak("unknown", "", gap);
     else if (result.status === "no_face") speak(result.reason === "far" ? "far" : "none", "", 12000);
@@ -115,6 +127,19 @@
   document.querySelectorAll("form.js-confirm").forEach((form) => {
     form.addEventListener("submit", (event) => {
       if (!window.confirm(form.dataset.confirm || "Confirmer ?")) event.preventDefault();
+    });
+  });
+
+  // Quick date chips ("Journée", "1 mois", ...)
+  document.querySelectorAll(".quick-dates").forEach((group) => {
+    const input = document.getElementById(group.dataset.target);
+    group.querySelectorAll(".chip").forEach((chip) => {
+      chip.addEventListener("click", () => {
+        const d = new Date();
+        if (chip.dataset.months) d.setMonth(d.getMonth() + Number(chip.dataset.months));
+        if (chip.dataset.days) d.setDate(d.getDate() + Number(chip.dataset.days));
+        input.value = d.toISOString().slice(0, 10);
+      });
     });
   });
 
@@ -207,53 +232,98 @@
   }
 
   // ---- Enrollment dialog (Members page) --------------------------------
+  // Flow: type the name -> "Ajouter et capturer" -> the dialog opens with the camera,
+  // the operator ticks the consent box, a 3-2-1 countdown runs and the face is captured
+  // automatically (retrying with voice hints if nobody is in front of the camera).
   const dialog = document.getElementById("enroll-dialog");
   if (dialog) {
     const video = document.getElementById("enroll-video");
     const statusEl = document.getElementById("enroll-status");
     const consent = document.getElementById("enroll-consent");
     const capture = document.getElementById("enroll-capture");
+    const countdownEl = document.getElementById("enroll-countdown");
     let memberId = null;
+    let timer = null;
+    let attempts = 0;
+    let capturing = false;
+
+    function clearTimer() { if (timer) clearTimeout(timer); timer = null; countdownEl.hidden = true; }
+
+    async function open(id, name) {
+      memberId = id;
+      attempts = 0;
+      document.getElementById("enroll-name").textContent = name;
+      consent.checked = false;
+      setStatus(statusEl, "");
+      if (!dialog.open) dialog.showModal();
+      const stream = await startCamera(video, statusEl);
+      if (stream) {
+        setStatus(statusEl, "Caméra active. Cochez l'accord : la capture démarre automatiquement.");
+        speak("camera_on");
+        consent.focus();
+      } else {
+        speak("camera_denied");
+      }
+    }
 
     document.querySelectorAll(".js-enroll").forEach((btn) => {
-      btn.addEventListener("click", async () => {
-        memberId = btn.dataset.member;
-        document.getElementById("enroll-name").textContent = btn.dataset.name;
-        consent.checked = false;
-        setStatus(statusEl, "");
-        dialog.showModal();
-        const stream = await startCamera(video, statusEl);
-        if (stream) {
-          setStatus(statusEl, "Caméra active : visage centré, bonne lumière, puis « Capturer ».");
-          speak("camera_on");
-        } else {
-          speak("camera_denied");
-        }
-      });
+      btn.addEventListener("click", () => open(btn.dataset.member, btn.dataset.name));
     });
+    if (dialog.dataset.autoOpen) {
+      const btn = document.querySelector('.js-enroll[data-member="' + dialog.dataset.autoOpen + '"]');
+      if (btn) open(btn.dataset.member, btn.dataset.name);
+      // Drop ?enroll= from the URL so a refresh does not reopen the dialog.
+      history.replaceState(null, "", window.location.pathname);
+    }
 
-    const close = () => { stopCamera(video); dialog.close(); };
+    const close = () => { clearTimer(); stopCamera(video); if (dialog.open) dialog.close(); };
     document.getElementById("enroll-cancel").addEventListener("click", close);
-    dialog.addEventListener("cancel", () => stopCamera(video));
+    dialog.addEventListener("cancel", () => { clearTimer(); stopCamera(video); });
 
-    capture.addEventListener("click", async () => {
+    async function doCapture() {
+      if (capturing) return;
       if (!consent.checked) {
-        setStatus(statusEl, "Cochez la case de consentement avant d'enregistrer.", "error");
+        setStatus(statusEl, "Cochez la case d'accord avant d'enregistrer.", "error");
         return;
       }
       if (!video.srcObject) {
         setStatus(statusEl, "Caméra inactive.", "error");
         return;
       }
+      capturing = true;
       capture.disabled = true;
       setStatus(statusEl, "Analyse du visage…");
       const url = capture.dataset.urlTemplate.replace(/0(\/enroll)$/, memberId + "$1");
       const result = await post(url, { image: snapshot(video), consent: true });
-      setStatus(statusEl, result.message, result.ok ? "ok" : "error");
+      capturing = false;
       capture.disabled = false;
-      if (result.ok) speak("enrolled"); else speakResult(result);
-      if (result.ok) setTimeout(() => { close(); window.location.reload(); }, 2200);
+      setStatus(statusEl, result.message, result.ok ? "ok" : "error");
+      if (result.ok) {
+        speak("enrolled");
+        setTimeout(() => { close(); window.location.replace(window.location.pathname); }, 2200);
+        return;
+      }
+      speakResult(result);
+      // Nobody (or several people) in front of the camera: retry automatically a few times.
+      attempts += 1;
+      if (consent.checked && ["no_face", "multi_face"].includes(result.status) && attempts < 8) {
+        timer = setTimeout(doCapture, 2500);
+      }
+    }
+
+    function countdown(n) {
+      clearTimer();
+      if (n === 0) { countdownEl.hidden = true; doCapture(); return; }
+      countdownEl.hidden = false;
+      countdownEl.textContent = n;
+      timer = setTimeout(() => countdown(n - 1), 800);
+    }
+
+    consent.addEventListener("change", () => {
+      if (consent.checked && video.srcObject) { attempts = 0; countdown(3); }
+      else clearTimer();
     });
+    capture.addEventListener("click", () => { clearTimer(); attempts = 0; doCapture(); });
   }
 
   // ---- Recognition kiosk (Access page) ---------------------------------
@@ -271,8 +341,9 @@
     let busy = false;
 
     const TITLES = {
-      granted: "ACCÈS AUTORISÉ",
-      expired: "ABONNEMENT EXPIRÉ",
+      granted: ({ office: "POINTAGE ENREGISTRÉ", canteen: "BON APPÉTIT" })[sector] || "ACCÈS AUTORISÉ",
+      already: "DÉJÀ ENREGISTRÉ AUJOURD'HUI",
+      expired: ({ office: "CONTRAT EXPIRÉ", canteen: "INSCRIPTION EXPIRÉE", coworking: "ACCÈS EXPIRÉ" })[sector] || "ABONNEMENT EXPIRÉ",
       unknown: "VISAGE INCONNU",
       no_face: "En attente d'un visage…",
       multi_face: "Une personne à la fois",
@@ -288,7 +359,7 @@
     }
 
     function pushLive(result) {
-      if (!["granted", "expired", "unknown"].includes(result.status)) return;
+      if (!["granted", "already", "expired", "unknown"].includes(result.status)) return;
       const li = document.createElement("li");
       li.className = "live-" + result.status;
       const time = new Date().toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
@@ -323,7 +394,7 @@
       if (!document.hidden) {
         const result = await check();
         if (result) {
-          if (result.status === "granted" || result.status === "expired" || result.status === "unknown") delay = 3000;
+          if (["granted", "already", "expired", "unknown"].includes(result.status)) delay = 3000;
           else if (result.code === 429) delay = 15000;
           else if (result.status === "error") delay = 5000;
         }
