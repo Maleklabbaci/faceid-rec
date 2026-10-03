@@ -64,15 +64,17 @@ Mots de passe hachés (Werkzeug), jeton CSRF sur tous les POST, cookies `HttpOnl
 pip install pytest && python -m pytest -q tests
 ```
 
-### Mettre en ligne (production)
-Toute plateforme Python convient (Render, Railway, Fly.io, un VPS avec Nginx…). Commande de démarrage :
+### Mettre en ligne — avec Cloudflare (recommandé)
+Workers/Pages ne peuvent pas exécuter le moteur facial (natif), mais **Cloudflare Tunnel** (gratuit) donne une URL HTTPS sur ton domaine à une app qui tourne sur ton PC ou un VPS, sans ouvrir de port. Tout est prêt :
 ```bash
-gunicorn -w 2 -b 0.0.0.0:$PORT web.wsgi:app
+cp .env.example .env          # SECRET_KEY + token du tunnel Cloudflare
+docker compose up -d --build  # app (gunicorn + moteur facial) + cloudflared
 ```
-Variables d'environnement :
-- `SECRET_KEY` — **obligatoire** en production (ex. `python -c "import secrets;print(secrets.token_hex(32))"`).
-- `WEB_DATABASE` — chemin du fichier SQLite, à placer sur un **disque persistant** (ex. `/data/web.db`).
-- `COOKIE_SECURE` — laisser à `1` (HTTPS). La caméra du navigateur exige HTTPS.
+Guide complet (VPS Docker, PC Windows sans Docker, test express `trycloudflare.com`, réglages Cloudflare à vérifier) : **[deploy/cloudflare.md](deploy/cloudflare.md)**.
+
+Autres hébergeurs Python (Render, Railway, Fly.io, VPS + Nginx) : même image Docker ou `gunicorn --preload -w 2 -b 0.0.0.0:$PORT web.wsgi:app`.
+
+Variables : `SECRET_KEY` (**obligatoire**), `WEB_DATABASE` (sur disque persistant ; la clé de session générée est stockée à côté), `TRUST_PROXY=1` derrière un proxy, `PRELOAD_FACE=1`, `COOKIE_SECURE=0` seulement en HTTP local. Supervision : `GET /healthz`.
 
 Base SQLite = suffisant pour démarrer et les premiers clients. Prévoir PostgreSQL au-delà (quelques dizaines d'entreprises actives en même temps).
 

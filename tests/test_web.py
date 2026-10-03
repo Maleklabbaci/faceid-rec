@@ -333,3 +333,29 @@ def test_upgrade_from_first_schema(tmp_path):
     conn.close()
     assert org == ("fitness", "Africa/Algiers", "08:30")
     assert entry == ("granted", "2026-10-03", "08:30", 0)  # 07:30 UTC = 08:30 in Algiers
+
+
+def test_healthz(client):
+    r = client.get("/healthz")
+    assert r.status_code == 200 and r.get_json()["status"] == "ok" and isinstance(r.get_json()["face_engine"], bool)
+
+
+def test_trust_proxy_rate_limits_per_cloudflare_client_ip(tmp_path):
+    """Behind Cloudflare Tunnel every request comes from 127.0.0.1: limits must key on CF-Connecting-IP."""
+    app = create_app({"DATABASE": str(tmp_path / "p.db"), "SESSION_COOKIE_SECURE": False, "TESTING": True, "TRUST_PROXY": True})
+    client = app.test_client()
+    token = csrf_of(client)
+    for _ in range(10):
+        client.post("/login", data={"csrf": token, "email": "x@y.z", "password": "bad"}, headers={"CF-Connecting-IP": "203.0.113.10"})
+    blocked = client.post("/login", data={"csrf": token, "email": "x@y.z", "password": "bad"}, headers={"CF-Connecting-IP": "203.0.113.10"})
+    other = client.post("/login", data={"csrf": token, "email": "x@y.z", "password": "bad"}, headers={"CF-Connecting-IP": "198.51.100.7"})
+    assert blocked.status_code == 429 and other.status_code == 200
+
+
+def test_database_dir_holds_session_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("WEB_DATABASE", str(tmp_path / "vol" / "web.db"))
+    monkeypatch.delenv("SECRET_KEY", raising=False)
+    first = create_app({"SESSION_COOKIE_SECURE": False, "TESTING": True})
+    second = create_app({"SESSION_COOKIE_SECURE": False, "TESTING": True})
+    assert (tmp_path / "vol" / "session.key").exists() and (tmp_path / "vol" / "web.db").exists()
+    assert first.secret_key == second.secret_key  # stable across restarts, stored on the persistent volume

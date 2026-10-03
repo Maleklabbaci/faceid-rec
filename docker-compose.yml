@@ -1,0 +1,32 @@
+# FaceID Platform behind Cloudflare Tunnel.
+#   1) cp .env.example .env   -> fill SECRET_KEY and CLOUDFLARE_TUNNEL_TOKEN
+#   2) docker compose up -d --build
+#   3) In Cloudflare Zero Trust, the tunnel's public hostname must point to  http://app:5000
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      WEB_DATABASE: /data/web.db
+      TRUST_PROXY: "1"
+      PRELOAD_FACE: "1"
+    volumes:
+      - faceid-data:/data
+    expose:
+      - "5000"
+    # Uncomment to also reach the app on the local network without Cloudflare (e.g. http://PC-IP:5000, set COOKIE_SECURE=0):
+    # ports:
+    #   - "5000:5000"
+
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN}
+    depends_on:
+      - app
+
+volumes:
+  faceid-data:
