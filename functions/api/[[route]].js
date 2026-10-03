@@ -17,22 +17,62 @@ const SESSION_DAYS = 30;
 const PBKDF2_ITERATIONS = 8000; // kept small for the free plan's CPU budget; combined with a server-side pepper (HMAC)
 const DUMMY_HASH = "v1$8000$AAAAAAAAAAAAAAAAAAAAAA==$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 
-const SCHEMA = [
+const TABLES = [
   "CREATE TABLE IF NOT EXISTS organizations(id INTEGER PRIMARY KEY, name TEXT NOT NULL, sector TEXT NOT NULL, timezone TEXT NOT NULL DEFAULT 'Africa/Algiers', work_start TEXT NOT NULL DEFAULT '08:30', late_tolerance INTEGER NOT NULL DEFAULT 10, created_at TEXT NOT NULL)",
   "CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL, email TEXT UNIQUE NOT NULL, password TEXT NOT NULL)",
   "CREATE TABLE IF NOT EXISTS members(id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL, name TEXT NOT NULL, email TEXT NOT NULL DEFAULT '', subscription_end TEXT NOT NULL, descriptor TEXT, consent_at TEXT)",
   "CREATE TABLE IF NOT EXISTS entries(id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL, member_id INTEGER NOT NULL, actor_id INTEGER NOT NULL, created_at TEXT NOT NULL, method TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'granted', local_date TEXT NOT NULL, local_time TEXT NOT NULL, late INTEGER NOT NULL DEFAULT 0)",
   "CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, expires_at INTEGER NOT NULL)",
   "CREATE TABLE IF NOT EXISTS limits(key TEXT PRIMARY KEY, count INTEGER NOT NULL, reset_at INTEGER NOT NULL)",
+];
+const INDEXES = [
   "CREATE INDEX IF NOT EXISTS members_org ON members(org_id)",
   "CREATE INDEX IF NOT EXISTS entries_org_day ON entries(org_id, local_date)",
   "CREATE INDEX IF NOT EXISTS entries_member ON entries(org_id, member_id, created_at)",
 ];
+// Pages projects are sometimes connected to a D1 database that was initialized by an
+// older version of the app. CREATE TABLE IF NOT EXISTS does not add new columns, and an
+// index referring to one of those columns then makes every API call fail. Keep additive,
+// data-preserving migrations here so binding an existing database is safe.
+const MIGRATIONS = {
+  organizations: {
+    timezone: "TEXT NOT NULL DEFAULT 'Africa/Algiers'",
+    work_start: "TEXT NOT NULL DEFAULT '08:30'",
+    late_tolerance: "INTEGER NOT NULL DEFAULT 10",
+    created_at: "TEXT NOT NULL DEFAULT ''",
+  },
+  members: {
+    email: "TEXT NOT NULL DEFAULT ''",
+    subscription_end: "TEXT NOT NULL DEFAULT ''",
+    descriptor: "TEXT",
+    consent_at: "TEXT",
+  },
+  entries: {
+    status: "TEXT NOT NULL DEFAULT 'granted'",
+    local_date: "TEXT NOT NULL DEFAULT ''",
+    local_time: "TEXT NOT NULL DEFAULT ''",
+    late: "INTEGER NOT NULL DEFAULT 0",
+  },
+};
 
 let schemaReady = null;
+async function initializeSchema(env) {
+  // Create tables first. Index statements must only be prepared after migrations because
+  // D1 validates referenced columns while preparing a statement.
+  await env.DB.batch(TABLES.map((sql) => env.DB.prepare(sql)));
+  for (const [table, columns] of Object.entries(MIGRATIONS)) {
+    const info = await env.DB.prepare(`PRAGMA table_info(${table})`).all();
+    const existing = new Set((info.results || []).map((column) => column.name));
+    for (const [column, definition] of Object.entries(columns)) {
+      if (!existing.has(column)) await env.DB.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`).run();
+    }
+  }
+  await env.DB.batch(INDEXES.map((sql) => env.DB.prepare(sql)));
+}
+
 function ensureSchema(env) {
   if (!schemaReady) {
-    schemaReady = env.DB.batch(SCHEMA.map((sql) => env.DB.prepare(sql))).catch((err) => { schemaReady = null; throw err; });
+    schemaReady = initializeSchema(env).catch((err) => { schemaReady = null; throw err; });
   }
   return schemaReady;
 }
