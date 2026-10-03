@@ -55,6 +55,32 @@ const MIGRATIONS = {
   },
 };
 
+// ---------------------------------------------------------------------------
+// The D1 binding
+// ---------------------------------------------------------------------------
+const BINDING_HELP =
+  "Dans Cloudflare Pages → votre projet → Settings → Bindings : supprimez la variable « DB » existante, " +
+  "puis « Add → D1 database » avec le nom de variable exactement DB, pointant vers la base faceid. " +
+  "Redéployez ensuite (Deployments → ⋯ → Retry deployment) : les liaisons sont figées à chaque déploiement.";
+
+function describeBinding(value) {
+  if (typeof value === "string") return "une variable texte — les valeurs de Settings → Variables doivent être des secrets/vars, pas la base";
+  if (value && typeof value.list === "function" && typeof value.get === "function") return "un namespace KV";
+  if (value && typeof value.idFromName === "function") return "un Durable Object";
+  if (value && typeof value.fetch === "function") return "une liaison de service (un autre worker)";
+  if (value && typeof value.get === "function") return "un bucket R2";
+  return `un ${value === null ? "null" : typeof value} sans méthode prepare()`;
+}
+
+function inspectBinding(env) {
+  const db = env && env.DB;
+  if (!db) return { ready: false, kind: "missing", problem: `Base D1 non liée sous le nom « DB ». ${BINDING_HELP}` };
+  if (typeof db.prepare === "function") return { ready: true, kind: "d1", db };
+  // A truthy env.DB that is not a database is the classic misbinding: it used to explode with
+  // "env.DB.prepare is not a function" in the invocation log and a bare 500 for every visitor.
+  return { ready: false, kind: "wrong-type", problem: `La liaison « DB » existe mais ce n'est pas une base D1 (${describeBinding(db)}). ${BINDING_HELP}` };
+}
+
 let schemaReady = null;
 async function initializeSchema(env) {
   // Create tables first. Index statements must only be prepared after migrations because
@@ -485,13 +511,22 @@ export async function onRequest(context) {
   const path = url.pathname.replace(/^\/api\/?/, "").replace(/\/$/, "");
   const method = request.method;
   try {
-    if (!env.DB) fail(503, "Base D1 non liée : ajoutez la liaison « DB » dans Cloudflare Pages → Settings → Bindings.");
-    await ensureSchema(env);
-
+    const binding = inspectBinding(env);
+    // /api/healthz stays reachable whatever happens: it is how a broken project explains itself.
     if (path === "healthz" && method === "GET") {
-      await env.DB.prepare("SELECT 1").first();
+      if (!binding.ready) return json({ status: "degraded", db: false, detail: binding.kind, message: binding.problem, pepper: Boolean(env.PEPPER) }, 503);
+      try {
+        await env.DB.prepare("SELECT 1").first();
+      } catch (err) {
+        return json({ status: "degraded", db: false, detail: "requête refusée par D1", message: String((err && err.message) || err), pepper: Boolean(env.PEPPER) }, 503);
+      }
       return json({ status: "ok", db: true, pepper: Boolean(env.PEPPER) });
     }
+    // Short for the person at the counter, full instructions in `hint` for the administrator
+    // (and for `wrangler tail`, where this used to surface as a bare TypeError).
+    if (!binding.ready) fail(503, "Le service est en cours de configuration : base de données non reliée. Réessayez dans un moment.", { hint: binding.problem });
+    await ensureSchema(env);
+
     if (path === "sectors" && method === "GET") return json({ sectors: SECTORS, timezones: TIMEZONES });
     if (path === "signup" && method === "POST") return await signup(env, request);
     if (path === "login" && method === "POST") return await login(env, request);
