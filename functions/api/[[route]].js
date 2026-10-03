@@ -14,6 +14,19 @@ const SECTORS = {
 const TIMEZONES = ["Africa/Algiers", "Africa/Casablanca", "Africa/Tunis", "Africa/Cairo", "Africa/Lagos", "Europe/Paris", "Asia/Dubai", "UTC"];
 const DUPLICATE_WINDOW_MS = 60_000;
 const SESSION_DAYS = 30;
+const DEVICE_DAYS = 365;          // a kiosk stays paired for a year; revocation is instant
+const PAIRING_TTL_SECONDS = 600;   // a pairing code lives 10 minutes and is single-use
+const PAIRING_MAX_PENDING = 5;
+const PAIRING_MAX_ATTEMPTS = 8;
+// Codes are read aloud and typed on a phone: no I/O/0/1, 32 symbols.
+const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const DEVICE_KINDS = {
+  kiosk: "Kiosque d'entrée",
+  phone: "Téléphone",
+  tablet: "Tablette",
+  desk: "Poste d'accueil",
+  box: "Boîtier / caméra sur site",
+};
 const PBKDF2_ITERATIONS = 8000; // kept small for the free plan's CPU budget; combined with a server-side pepper (HMAC)
 const DUMMY_HASH = "v1$8000$AAAAAAAAAAAAAAAAAAAAAA==$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 
@@ -24,11 +37,15 @@ const TABLES = [
   "CREATE TABLE IF NOT EXISTS entries(id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL, member_id INTEGER NOT NULL, actor_id INTEGER NOT NULL, created_at TEXT NOT NULL, method TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'granted', local_date TEXT NOT NULL, local_time TEXT NOT NULL, late INTEGER NOT NULL DEFAULT 0)",
   "CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, expires_at INTEGER NOT NULL)",
   "CREATE TABLE IF NOT EXISTS limits(key TEXT PRIMARY KEY, count INTEGER NOT NULL, reset_at INTEGER NOT NULL)",
+  "CREATE TABLE IF NOT EXISTS pairings(code TEXT PRIMARY KEY, org_id INTEGER NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'kiosk', created_at TEXT NOT NULL, expires_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0)",
+  "CREATE TABLE IF NOT EXISTS devices(id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'kiosk', token_hash TEXT UNIQUE NOT NULL, created_at TEXT NOT NULL, last_seen_at TEXT, revoked_at TEXT)",
 ];
 const INDEXES = [
   "CREATE INDEX IF NOT EXISTS members_org ON members(org_id)",
   "CREATE INDEX IF NOT EXISTS entries_org_day ON entries(org_id, local_date)",
   "CREATE INDEX IF NOT EXISTS entries_member ON entries(org_id, member_id, created_at)",
+  "CREATE INDEX IF NOT EXISTS devices_org ON devices(org_id, revoked_at)",
+  "CREATE INDEX IF NOT EXISTS pairings_org ON pairings(org_id, expires_at)",
 ];
 // Pages projects are sometimes connected to a D1 database that was initialized by an
 // older version of the app. CREATE TABLE IF NOT EXISTS does not add new columns, and an
@@ -48,6 +65,7 @@ const MIGRATIONS = {
     consent_at: "TEXT",
   },
   entries: {
+    device_id: "INTEGER",
     status: "TEXT NOT NULL DEFAULT 'granted'",
     local_date: "TEXT NOT NULL DEFAULT ''",
     local_time: "TEXT NOT NULL DEFAULT ''",
@@ -179,14 +197,16 @@ function cookieOptions(env, request) {
   return { secure: isSecureRequest(request), embed: Boolean(env && env.EMBED_PREVIEW) };
 }
 
-function sessionCookie(token, maxAge, { secure = true, embed = false } = {}) {
+function authCookie(name, token, maxAge, { secure = true, embed = false } = {}) {
   // EMBED_PREVIEW=1 (local demos inside a third-party iframe only) relaxes SameSite; never set it in production.
-  const parts = [`sid=${token}`, "Path=/", "HttpOnly"];
+  const parts = [`${name}=${token}`, "Path=/", "HttpOnly"];
   if (embed && secure) parts.push("SameSite=None", "Secure"); // SameSite=None is refused without Secure
   else { if (secure) parts.push("Secure"); parts.push("SameSite=Lax"); }
   parts.push(`Max-Age=${maxAge}`);
   return parts.join("; ");
 }
+
+const sessionCookie = (token, maxAge, options) => authCookie("sid", token, maxAge, options);
 
 function localParts(timezone, date = new Date()) {
   let fmt;
@@ -237,13 +257,19 @@ async function limited(env, key, max, windowSeconds) {
   await env.DB.prepare("UPDATE limits SET count=count+1 WHERE key=?").bind(key).run();
 }
 
-function assertSameOrigin(request) {
+function assertSameOrigin(request, { allowNoOrigin = false } = {}) {
   // Fetch-metadata based CSRF protection for all state-changing calls.
   const site = request.headers.get("Sec-Fetch-Site");
   if (site && site !== "same-origin" && site !== "none") fail(403, "Requête inter-site refusée.");
   const origin = request.headers.get("Origin");
   if (origin && origin !== new URL(request.url).origin) fail(403, "Origine inattendue.");
-  if (!site && !origin) fail(403, "Requête sans origine refusée.");
+  // allowNoOrigin is for non-browser clients (a box, curl, a camera relay): they send neither
+  // Origin nor Sec-Fetch-Site. A cross-site *browser* request is still refused above.
+  if (!site && !origin && !allowNoOrigin) fail(403, "Requête sans origine refusée.");
+}
+
+function hasBearerToken(request) {
+  return /^Bearer\s+\S+/i.test(request.headers.get("Authorization") || "");
 }
 
 async function readJson(request) {
@@ -305,8 +331,8 @@ async function record(env, user, member, method) {
     }
     status = "granted";
   }
-  await env.DB.prepare("INSERT INTO entries(org_id,member_id,actor_id,created_at,method,status,local_date,local_time,late) VALUES(?,?,?,?,?,?,?,?,?)")
-    .bind(user.org_id, member.id, user.user_id, new Date().toISOString(), method, status, local.date, local.time, result.late ? 1 : 0).run();
+  await env.DB.prepare("INSERT INTO entries(org_id,member_id,actor_id,created_at,method,status,local_date,local_time,late,device_id) VALUES(?,?,?,?,?,?,?,?,?,?)")
+    .bind(user.org_id, member.id, user.user_id || 0, new Date().toISOString(), method, status, local.date, local.time, result.late ? 1 : 0, user.device_id || null).run();
   return result;
 }
 
@@ -378,24 +404,58 @@ async function logout(env, request) {
   return json({ ok: true, redirect: "/" }, 200, { "Set-Cookie": sessionCookie("", 0, cookieOptions(env, request)) });
 }
 
-async function state(env, user) {
+async function state(env, user, params = new URLSearchParams()) {
   const org = user.org_id;
   const sector = user.sectorConfig;
   const today = localParts(user.timezone).date;
-  const [membersRes, logsRes, countsRes, lateRes] = await env.DB.batch([
-    env.DB.prepare("SELECT id,name,email,subscription_end,consent_at IS NOT NULL AS enrolled FROM members WHERE org_id=? ORDER BY id DESC").bind(org),
-    env.DB.prepare("SELECT entries.id, entries.method, entries.status, entries.local_date, entries.local_time, entries.late, members.name FROM entries JOIN members ON members.id=entries.member_id WHERE entries.org_id=? ORDER BY entries.id DESC LIMIT 30").bind(org),
+  // Deux réglages de lecture pour l'interface : la fenêtre du graphique/période, et le pointeur
+  // du direct (« since ») qui ne renvoie que les passages parus depuis la dernière fois — c'est
+  // ce qui permet à l'espace de notifier une entrée fraîche sans rappeler tout le journal.
+  const days = Math.min(90, Math.max(1, Number(params.get("days")) || 7));
+  const since = Math.max(0, Number(params.get("since")) || 0);
+  const from = shiftDay(today, 1 - days);
+  const logsSql = `SELECT entries.id, entries.method, entries.status, entries.local_date, entries.local_time, entries.late, entries.device_id, members.name,
+                          devices.name AS device_name
+                   FROM entries JOIN members ON members.id=entries.member_id
+                   LEFT JOIN devices ON devices.id=entries.device_id
+                   WHERE entries.org_id=?${since ? " AND entries.id>?" : ""} ORDER BY entries.id DESC LIMIT ${since ? 200 : 30}`;
+  const logsStmt = env.DB.prepare(logsSql);
+  const [membersRes, logsRes, countsRes, lateRes, periodRes, devicesRes, headRes] = await env.DB.batch([
+    env.DB.prepare(`SELECT m.id, m.name, m.email, m.subscription_end, m.consent_at IS NOT NULL AS enrolled,
+                           (SELECT MAX(e.local_time) FROM entries e WHERE e.org_id=m.org_id AND e.member_id=m.id AND e.status='granted' AND e.local_date=?) AS last_today
+                    FROM members m WHERE m.org_id=? ORDER BY m.id DESC`).bind(today, org),
+    since ? logsStmt.bind(org, since) : logsStmt.bind(org),
     env.DB.prepare("SELECT status, COUNT(*) AS n, COUNT(DISTINCT member_id) AS people FROM entries WHERE org_id=? AND local_date=? GROUP BY status").bind(org, today),
     env.DB.prepare("SELECT COUNT(*) AS n FROM entries WHERE org_id=? AND local_date=? AND late=1").bind(org, today),
+    env.DB.prepare("SELECT local_date, status, COUNT(*) AS n, COUNT(DISTINCT member_id) AS people FROM entries WHERE org_id=? AND local_date>=? GROUP BY local_date, status").bind(org, from),
+    env.DB.prepare("SELECT id, name, last_seen_at, revoked_at FROM devices WHERE org_id=?").bind(org),
+    env.DB.prepare("SELECT MAX(id) AS head FROM entries WHERE org_id=?").bind(org),
   ]);
   const members = membersRes.results;
-  const logs = logsRes.results;
+  // La même phrase que celle du kiosque : l'écran de l'entreprise raconte le passage, il ne le
+  // numérote pas. Un refus reste sans message : c'est la règle de l'espace qui a protégé l'entrée,
+  // pas une panne du poste. C'est ce texte qui sert de corps à la notification ; le retard, lui,
+  // reste un badge (la colonne le dit mieux qu'une phrase répétée).
+  const logs = (logsRes.results || []).map((l) => ({ ...l, late: Boolean(l.late), message: l.status === "granted" ? entryMessage(sector, l.name, { local_time: l.local_time, late: false, late_minutes: 0 }) : "" }));
   const counts = Object.fromEntries(countsRes.results.map((r) => [r.status, r]));
   const active = members.filter((m) => m.subscription_end >= today).length;
   const entriesToday = counts.granted?.n || 0;
   const presentToday = counts.granted?.people || 0;
   const refusedToday = counts.refused?.n || 0;
   const lateToday = lateRes.results[0]?.n || 0;
+  const period = { from, to: today, days, granted: 0, refused: 0, people: 0, late: 0, byDay: {} };
+  for (const row of periodRes.results || []) {
+    period.byDay[row.local_date] = (period.byDay[row.local_date] || 0) + (row.status === "granted" ? row.n : 0);
+    if (row.status === "granted") { period.granted += row.n; period.people = Math.max(period.people, row.people); }
+    else period.refused += row.n;
+    if (row.status === "granted" && row.local_date === today) period.late = lateToday;
+  }
+  const deviceRows = devicesRes.results || [];
+  const now = Date.now();
+  const devicesInfo = {
+    count: deviceRows.filter((d) => !d.revoked_at).length,
+    online: deviceRows.filter((d) => d.last_seen_at && now - Date.parse(d.last_seen_at) < 120000).length,
+  };
   let kpis;
   if (sector.rule === "attendance") kpis = [["Employés", members.length, ""], ["Présents aujourd'hui", presentToday, "ok"], ["Absents", Math.max(active - presentToday, 0), "warn"], ["Retards aujourd'hui", lateToday, "warn"], ["Pointages aujourd'hui", entriesToday, ""]];
   else if (sector.rule === "one_per_day") kpis = [["Inscrits", members.length, ""], ["Repas servis aujourd'hui", entriesToday, "ok"], ["Inscriptions actives", active, ""], ["Expirées", members.length - active, "warn"], ["Refus aujourd'hui", refusedToday, "warn"]];
@@ -410,14 +470,13 @@ async function state(env, user) {
       .map((m) => ({ name: m.name, arrival: first[m.id]?.arrival || null, late: Boolean(first[m.id]?.late) }))
       .sort((a, b) => (a.arrival === null) - (b.arrival === null) || (a.arrival || "").localeCompare(b.arrival || "") || a.name.localeCompare(b.name));
   }
-  const days = Array.from({ length: 7 }, (_, i) => shiftDay(today, i - 6));
-  const { results: perDay } = await env.DB.prepare("SELECT local_date, COUNT(*) AS n FROM entries WHERE org_id=? AND status='granted' AND local_date>=? GROUP BY local_date").bind(org, days[0]).all();
-  const byDay = Object.fromEntries(perDay.map((r) => [r.local_date, r.n]));
-  const chart = days.map((d) => ({ day: d.slice(5), count: byDay[d] || 0 }));
+  const chartDays = Array.from({ length: days }, (_, i) => shiftDay(today, i - (days - 1)));
+  const chart = chartDays.map((d) => ({ day: d.slice(5), count: period.byDay[d] || 0 }));
   return json({
     user: { email: user.email },
     org: { name: user.org_name, sector: user.sector, timezone: user.timezone, work_start: user.work_start, late_tolerance: user.late_tolerance },
     sector, sectors: SECTORS, timezones: TIMEZONES, today, members, logs, kpis, attendance, chart,
+    period, devices: devicesInfo, head: headRes.results[0]?.head || 0, since,
   });
 }
 
@@ -472,6 +531,25 @@ async function revoke(env, user, member) {
   return json({ ok: true, message: "Données biométriques effacées." });
 }
 
+/**
+ * Journal filtré par période, sans le reste de l'état : c'est ce que l'interface télécharge quand
+ * on clique sur « Exporter en CSV » (et ce qu'un client tiers peut lire pour son propre tableur).
+ */
+async function journal(env, user, params) {
+  const days = Math.min(365, Math.max(1, Number(params.get("days")) || 30));
+  const today = localParts(user.timezone).date;
+  const from = shiftDay(today, 1 - days);
+  const { results } = await env.DB.prepare(
+    `SELECT entries.id, entries.member_id, members.name, members.email, entries.method, entries.status,
+            entries.local_date, entries.local_time, entries.late, devices.name AS device_name
+     FROM entries JOIN members ON members.id=entries.member_id
+     LEFT JOIN devices ON devices.id=entries.device_id
+     WHERE entries.org_id=? AND entries.local_date>=?
+     ORDER BY entries.local_date DESC, entries.id DESC LIMIT 5000`
+  ).bind(user.org_id, from).all();
+  return json({ ok: true, from, to: today, days, count: results.length, rows: results.map((r) => ({ ...r, late: Boolean(r.late) })) });
+}
+
 async function descriptors(env, user) {
   const { results } = await env.DB.prepare("SELECT id, name, subscription_end, descriptor FROM members WHERE org_id=? AND descriptor IS NOT NULL AND consent_at IS NOT NULL").bind(user.org_id).all();
   return json({ members: results.map((r) => ({ id: r.id, name: r.name, subscription_end: r.subscription_end, d: JSON.parse(r.descriptor) })) });
@@ -503,6 +581,183 @@ async function settings(env, user, request) {
 }
 
 // ---------------------------------------------------------------------------
+// Linked devices: an admin mints a short code, the other device redeems it and
+// gets a token. A linked device can *only* run the kiosk: recognise a face and
+// log a passage. No member list, no subscription, no settings, no journal export.
+// ---------------------------------------------------------------------------
+
+function pairingCode() {
+  const bytes = randomBytes(6);
+  let out = "";
+  for (let i = 0; i < bytes.length; i++) out += CODE_ALPHABET[bytes[i] % CODE_ALPHABET.length];
+  return out;
+}
+
+// Codes get typed on a phone: spaces and case are the user's business, not ours.
+const normalizeCode = (value) => String(value == null ? "" : value).toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 8);
+const deviceKind = (value) => (DEVICE_KINDS[value] ? value : "kiosk");
+const deviceName = (value) => {
+  const name = String(value == null ? "" : value).replace(/\s+/g, " ").trim().slice(0, 60);
+  return name;
+};
+
+/** Admin screen: what is linked right now, and which codes are still waiting. */
+async function devices(env, user) {
+  const now = Date.now();
+  const [list, pending] = await env.DB.batch([
+    env.DB.prepare("SELECT id, name, kind, created_at, last_seen_at, revoked_at FROM devices WHERE org_id=? ORDER BY id DESC").bind(user.org_id),
+    env.DB.prepare("SELECT code, name, kind, expires_at FROM pairings WHERE org_id=? AND expires_at>? ORDER BY expires_at DESC").bind(user.org_id, now),
+  ]);
+  return json({
+    ok: true,
+    devices: (list.results || []).map((d) => ({ ...d, kind_label: DEVICE_KINDS[d.kind] || DEVICE_KINDS.kiosk, online: Boolean(d.last_seen_at) && Date.now() - Date.parse(d.last_seen_at) < 120000 })),
+    pairings: (pending.results || []).map((p) => ({ ...p, kind_label: DEVICE_KINDS[p.kind] || DEVICE_KINDS.kiosk, seconds_left: Math.max(0, Math.round((p.expires_at - now) / 1000)) })),
+  });
+}
+
+/** Admin action: open a door for 10 minutes. */
+async function createPairing(env, user, request) {
+  const body = await readJson(request);
+  const name = deviceName(body.name);
+  if (name.length < 2) fail(400, "Donnez un nom d'au moins 2 caractères à l'appareil (ex. « Borne entrée »).");
+  const kind = deviceKind(body.kind);
+  const now = Date.now();
+  const pending = await env.DB.prepare("SELECT code FROM pairings WHERE org_id=? AND expires_at>?").bind(user.org_id, now).all();
+  if ((pending.results || []).length >= PAIRING_MAX_PENDING) fail(409, "Trop de codes en attente : annulez-en un avant d'en générer un autre.");
+  let code = pairingCode();
+  for (let i = 0; i < 5; i++) {
+    const clash = await env.DB.prepare("SELECT code FROM pairings WHERE code=?").bind(code).first();
+    if (!clash) break;
+    code = pairingCode();
+    if (i === 4) fail(503, "Impossible de trouver un code libre, réessayez.");
+  }
+  await env.DB.prepare("INSERT INTO pairings(code,org_id,name,kind,created_at,expires_at,attempts) VALUES(?,?,?,?,?,?,0)")
+    .bind(code, user.org_id, name, kind, new Date().toISOString(), now + PAIRING_TTL_SECONDS * 1000).run();
+  return json({
+    ok: true, code, name, kind, kind_label: DEVICE_KINDS[kind],
+    link: `/kiosk?pair=${code}`,
+    expires_in: PAIRING_TTL_SECONDS,
+    message: `Code ${code} prêt : ouvrez le lien sur l'appareil à relier, ou saisissez ce code sur /kiosk.`,
+  });
+}
+
+async function cancelPairing(env, user, request) {
+  const code = normalizeCode((await readJson(request)).code);
+  await env.DB.prepare("DELETE FROM pairings WHERE code=? AND org_id=?").bind(code, user.org_id).run();
+  return json({ ok: true, message: "Code annulé." });
+}
+
+/** Public, unauthenticated: the device redeems its code and comes back with a token. */
+async function pair(env, request) {
+  // A browser must be on this site; a camera box has no Origin header at all, so that case is
+  // allowed through. Nothing here relies on cookies: the single-use code and the IP budget do the work.
+  assertSameOrigin(request, { allowNoOrigin: true });
+  await limited(env, `pair:${clientIp(request)}`, 15, 300);
+  const body = await readJson(request);
+  const code = normalizeCode(body.code);
+  if (code.length !== 6) fail(400, "Code invalide : 6 caractères, sans espaces.");
+  const row = await env.DB.prepare("SELECT * FROM pairings WHERE code=?").bind(code).first();
+  if (!row) fail(404, "Ce code n'existe pas. Régénérez-le depuis l'espace de l'entreprise.");
+  if (row.expires_at < Date.now()) {
+    await env.DB.prepare("DELETE FROM pairings WHERE code=?").bind(code).run();
+    fail(410, "Ce code a expiré. Redemandez-en un dans l'espace de l'entreprise.");
+  }
+  if (row.attempts >= PAIRING_MAX_ATTEMPTS) fail(429, "Trop d'essais avec ce code. Redemandez-en un nouveau.");
+  // A code hammered by a stuck client gets burned; a successful redeem deletes the row anyway.
+  await env.DB.prepare("UPDATE pairings SET attempts=attempts+1 WHERE code=?").bind(code).run();
+  const org = await env.DB.prepare("SELECT id, name, sector, timezone FROM organizations WHERE id=?").bind(row.org_id).first();
+  if (!org) fail(410, "Cet espace n'existe plus.");
+  const token = b64url(randomBytes(32));
+  const hash = await sha256hex(token);
+  let device;
+  try {
+    [device] = await env.DB.batch([
+      env.DB.prepare("INSERT INTO devices(org_id,name,kind,token_hash,created_at) VALUES(?,?,?,?,?)").bind(row.org_id, row.name, row.kind, hash, new Date().toISOString()),
+      env.DB.prepare("DELETE FROM pairings WHERE code=?").bind(code),
+    ]);
+  } catch (err) {
+    if (/UNIQUE/i.test(String(err && err.message))) fail(409, "Jeton déjà émis, régénérez un code.");
+    throw err;
+  }
+  const name = deviceName(body.name);
+  if (name) await env.DB.prepare("UPDATE devices SET name=? WHERE id=?").bind(name, device.meta.last_row_id).run();
+  const kind = body.kind ? deviceKind(body.kind) : row.kind;
+  if (kind !== row.kind) await env.DB.prepare("UPDATE devices SET kind=? WHERE id=?").bind(kind, device.meta.last_row_id).run();
+  return json({
+    ok: true,
+    token,
+    device: { id: device.meta.last_row_id, name: name || row.name, kind, kind_label: DEVICE_KINDS[kind] },
+    org: { name: org.name, sector: SECTORS[org.sector] ? org.sector : "fitness" },
+    message: `${name || row.name} est relié à ${org.name}.`,
+  }, 200, { "Set-Cookie": authCookie("did", token, DEVICE_DAYS * 86400, cookieOptions(env, request)) });
+}
+
+/** Who is calling: a paired device (cookie `did` or `Authorization: Bearer`). */
+async function currentDevice(env, request) {
+  const auth = request.headers.get("Authorization") || "";
+  const bearer = auth.match(/^Bearer\s+(\S+)$/i);
+  const token = bearer ? bearer[1] : cookieValue(request, "did");
+  if (!token) return null;
+  const row = await env.DB.prepare(
+    `SELECT devices.id AS device_id, devices.name AS device_name, devices.kind, devices.org_id,
+            organizations.name AS org_name, organizations.sector, organizations.timezone,
+            organizations.work_start, organizations.late_tolerance
+     FROM devices JOIN organizations ON organizations.id=devices.org_id
+     WHERE devices.token_hash=? AND devices.revoked_at IS NULL`
+  ).bind(await sha256hex(token)).first();
+  if (!row) return null;
+  if (!SECTORS[row.sector]) row.sector = "fitness";
+  row.sectorConfig = SECTORS[row.sector];
+  row.user_id = 0;              // no human behind a kiosk: the row is its own author
+  row.email = row.device_name;
+  return row;
+}
+
+/** What a kiosk needs to run: its identity, the sector rules, today, and the last passages. */
+async function deviceState(env, device) {
+  const local = localParts(device.timezone);
+  const [counts, logs] = await env.DB.batch([
+    env.DB.prepare("SELECT status, COUNT(*) AS n, COUNT(DISTINCT member_id) AS people FROM entries WHERE org_id=? AND local_date=? GROUP BY status").bind(device.org_id, local.date),
+    env.DB.prepare(
+      `SELECT entries.id, entries.method, entries.status, entries.local_date, entries.local_time, entries.late,
+              members.name, devices.name AS device_name
+       FROM entries JOIN members ON members.id=entries.member_id
+       LEFT JOIN devices ON devices.id=entries.device_id
+       WHERE entries.org_id=? ORDER BY entries.id DESC LIMIT 12`
+    ).bind(device.org_id),
+    env.DB.prepare("UPDATE devices SET last_seen_at=? WHERE id=?").bind(new Date().toISOString(), device.device_id),
+  ]);
+  const byStatus = {};
+  let people = 0;
+  for (const row of counts.results || []) { byStatus[row.status] = row.n; if (row.status === "granted") people = row.people; }
+  return json({
+    ok: true, user: null,
+    device: { id: device.device_id, name: device.device_name, kind: device.kind, kind_label: DEVICE_KINDS[device.kind] },
+    org: { name: device.org_name, sector: device.sector },
+    sector: device.sectorConfig,
+    today: local.date,
+    granted: byStatus.granted || 0,
+    refused: byStatus.refused || 0,
+    people,
+    logs: (logs.results || []).map((e) => ({ ...e, late: Boolean(e.late), message: entryMessage(device.sectorConfig, e.name, { granted: e.status === "granted", late: Boolean(e.late), late_minutes: 0 }) })),
+  });
+}
+
+/** Admin action: rename or revoke. Revocation is immediate — the token stops resolving. */
+async function updateDevice(env, user, deviceId, request, action) {
+  if (action === "revoke") {
+    const done = await env.DB.prepare("UPDATE devices SET revoked_at=? WHERE id=? AND org_id=?").bind(new Date().toISOString(), deviceId, user.org_id).run();
+    if (!done.meta.changes) fail(404, "Appareil introuvable dans votre espace.");
+    return json({ ok: true, message: "Appareil révoqué. Son jeton ne fonctionne plus, sur aucun de ses kiosques." });
+  }
+  const name = deviceName((await readJson(request)).name);
+  if (!name) fail(400, "Nom trop court.");
+  const done = await env.DB.prepare("UPDATE devices SET name=? WHERE id=? AND org_id=?").bind(name, deviceId, user.org_id).run();
+  if (!done.meta.changes) fail(404, "Appareil introuvable dans votre espace.");
+  return json({ ok: true, name, message: "Nom mis à jour." });
+}
+
+// ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
 export async function onRequest(context) {
@@ -528,6 +783,29 @@ export async function onRequest(context) {
     await ensureSchema(env);
 
     if (path === "sectors" && method === "GET") return json({ sectors: SECTORS, timezones: TIMEZONES });
+    // A device redeems its code here. No CSRF assertion: the caller may be a box on the
+    // shop floor with no Origin header at all — the single-use code and the rate limit are the guard.
+    if (path === "pair" && method === "POST") return await pair(env, request);
+
+    // ---- a linked device: kiosk rights only, forever -----------------------
+    if (path === "device" || path.startsWith("device/")) {
+      const device = await currentDevice(env, request);
+      if (!device) fail(401, "Appareil non relié. Saisissez le code affiché dans l'espace de l'entreprise.");
+      const action = path === "device" ? "state" : path.slice(7);
+      if (action === "state" && method === "GET") return await deviceState(env, device);
+      if (action === "descriptors" && method === "GET") return await descriptors(env, device);
+      if (method !== "GET" && !hasBearerToken(request)) assertSameOrigin(request); // cookies need CSRF cover; Bearer calls don't
+      if (action === "recognized" && method === "POST") return await recognized(env, device, request);
+      if (action === "unpair" && method === "POST") {
+        // Forget this browser only: the token itself stays valid until an administrator revokes it.
+        return json({ ok: true, message: "Cet appareil n'est plus relié au kiosque." }, 200, { "Set-Cookie": authCookie("did", "", 0, cookieOptions(env, request)) });
+      }
+      if (action === "entry" && method === "POST") {
+        const body = await readJson(request);
+        return await manualEntry(env, device, await memberOf(env, device, Number(body.member_id)));
+      }
+      fail(404, "Route inconnue.");
+    }
     if (path === "signup" && method === "POST") return await signup(env, request);
     if (path === "login" && method === "POST") return await login(env, request);
     if (path === "logout" && method === "POST") return await logout(env, request);
@@ -537,11 +815,22 @@ export async function onRequest(context) {
     if (!user) fail(401, "Connexion requise.");
     if (method !== "GET") assertSameOrigin(request);
 
-    if (path === "state" && method === "GET") return await state(env, user);
+    if (path === "state" && method === "GET") return await state(env, user, url.searchParams);
     if (path === "descriptors" && method === "GET") return await descriptors(env, user);
+    if (path === "journal" && method === "GET") return await journal(env, user, url.searchParams);
     if (path === "members" && method === "POST") return await addMember(env, user, request);
     if (path === "recognized" && method === "POST") return await recognized(env, user, request);
     if (path === "settings" && method === "POST") return await settings(env, user, request);
+
+    if (path === "devices" && method === "GET") return await devices(env, user);
+    if (path === "devices/pairing" && method === "POST") return await createPairing(env, user, request);
+    if (path === "devices/pairing/cancel" && method === "POST") return await cancelPairing(env, user, request);
+    if (path === "devices/revoke-all" && method === "POST") {
+      const done = await env.DB.prepare("UPDATE devices SET revoked_at=? WHERE org_id=? AND revoked_at IS NULL").bind(new Date().toISOString(), user.org_id).run();
+      return json({ ok: true, revoked: done.meta.changes || 0, message: done.meta.changes ? `${done.meta.changes} kiosque(s) déconnecté(s) : plus aucun jeton de votre espace ne fonctionne.` : "Aucun appareil à déconnecter." });
+    }
+    const dev = path.match(/^devices\/(\d+)\/(revoke|rename)$/);
+    if (dev && method === "POST") return await updateDevice(env, user, Number(dev[1]), request, dev[2]);
 
     const m = path.match(/^members\/(\d+)\/(renew|delete|entry|enroll|revoke)$/);
     if (m && method === "POST") {

@@ -36,7 +36,7 @@ after(() => { if (server) { try { process.kill(-server.pid, "SIGTERM"); } catch 
 // Minimal cookie-aware client, same-origin headers like a browser fetch.
 function client(base = BASE) {
   let cookie = "";
-  const ip = `198.51.100.${Math.floor(Math.random() * 254) + 1}`; // one "visitor" per client (rate limits are per IP)
+  const ip = visitorIp(); // one "visitor" per client (rate limits are per IP)
   async function call(path, body, method, extraHeaders = {}) {
     const headers = { Origin: base, "Sec-Fetch-Site": "same-origin", "CF-Connecting-IP": ip, ...extraHeaders };
     if (cookie) headers.Cookie = cookie;
@@ -52,6 +52,10 @@ function client(base = BASE) {
 }
 
 const uniq = () => Math.random().toString(36).slice(2, 8);
+// Les budgets de tentatives sont comptés par adresse. Ce fichier peut être rejoué contre un
+// serveur déjà lancé dont l'état D1 a gardé les buckets de la fois précédente : chaque client
+// prend donc une adresse tirée dans un espace assez large pour ne jamais se rentrer dedans.
+const visitorIp = () => `10.${64 + Math.floor(Math.random() * 64)}.${Math.floor(Math.random() * 256)}.${1 + Math.floor(Math.random() * 254)}`;
 const descriptor = (seed) => Array.from({ length: 128 }, (_, i) => Math.sin(seed + i) / 11);
 const today = new Date().toISOString().slice(0, 10);
 const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
@@ -234,11 +238,12 @@ test("office: settings, lateness and attendance board", async () => {
   assert.equal(state.attendance[0].name, "Karim");
   assert.equal(state.attendance[0].late, true);
   assert.equal(state.attendance[1].arrival, null);
-  assert.equal(state.logs[0].late, 1);
+  assert.equal(state.logs[0].late, true, "un retard, partout le même mot, partout un booléen");
+  assert.match(state.logs[0].message, /^Karim : pointage enregistré à \d\d:\d\d\.$/, "la phrase du kiosque est celle de l'écran");
 });
 
 test("login rate limit: per account and per visitor, but never a whole office", async () => {
-  const ip = `192.0.2.${Math.floor(Math.random() * 254) + 1}`; // fresh bucket per run
+  const ip = visitorIp(); // une seule adresse pour tout le test, mais tirée à chaque exécution
   const c = client();
   const email = `nobody-${uniq()}@example.com`;
   let last;
@@ -252,7 +257,7 @@ test("login rate limit: per account and per visitor, but never a whole office", 
 });
 
 test("signup validation does not burn the hourly signup budget", async () => {
-  const ip = `192.0.2.${Math.floor(Math.random() * 254) + 1}`;
+  const ip = visitorIp();
   const c = client();
   for (let i = 0; i < 4; i++) {
     const r = await c.call("/api/signup", { company: "Trop court", sector: "fitness", email: `oops-${uniq()}@example.com`, password: "court" }, "POST", { "CF-Connecting-IP": ip });
@@ -265,18 +270,276 @@ test("signup validation does not burn the hourly signup budget", async () => {
 test("session cookie: Secure over HTTPS, still usable on a plain-HTTP kiosk", async (t) => {
   const c = client();
   const body = { company: "Kiosque LAN", sector: "fitness", email: `cookie-${uniq()}@example.com`, password: "motdepasse-kiosque-12" };
+  // Adresses tirées au sort : ce fichier peut être rejoué contre un serveur déjà lancé, dont
+  // l'état D1 a retenu les budgets d'inscription de la fois précédente.
   // Cloudflare terminates TLS and forwards the scheme; loopback counts as a secure context too.
-  const secure = await c.call("/api/signup", body, "POST", { "X-Forwarded-Proto": "https", "CF-Connecting-IP": "198.51.100.200" });
+  const ips = { secure: visitorIp(), lan: visitorIp() };
+  const secure = await c.call("/api/signup", body, "POST", { "X-Forwarded-Proto": "https", "CF-Connecting-IP": ips.secure });
   assert.equal(secure.status, 200, JSON.stringify(secure.data));
   assert.match(secure.headers.get("set-cookie"), /HttpOnly/, "the cookie is never readable from scripts");
   assert.match(secure.headers.get("set-cookie"), /Secure; SameSite=Lax/, "HTTPS keeps the Secure flag");
   if (!LAN_BASE) { t.skip("no second network address in this sandbox"); return; }
   const c2 = client(LAN_BASE); // the same app, reached as http://192.168.x.x from the LAN
-  const plain = await c2.call("/api/signup", { ...body, email: `lan-${uniq()}@example.com`, company: "Kiosque LAN 2" }, "POST", { "CF-Connecting-IP": "198.51.100.201" });
+  const plain = await c2.call("/api/signup", { ...body, email: `lan-${uniq()}@example.com`, company: "Kiosque LAN 2" }, "POST", { "CF-Connecting-IP": ips.lan });
   assert.equal(plain.status, 200, JSON.stringify(plain.data));
   const cookie = plain.headers.get("set-cookie");
   assert.equal(/;\s*Secure/.test(cookie), false, "no Secure flag over plain HTTP: browsers would drop the cookie and the login would loop");
   assert.match(cookie, /HttpOnly/);
   assert.match(cookie, /SameSite=Lax/);
   assert.equal((await c2.call("/api/state")).status, 200, "…and that cookie really authenticates the next call");
+});
+
+// ---------------------------------------------------------------------------
+// Linked devices: pairing codes, the kiosk-only scope, revocation.
+// ---------------------------------------------------------------------------
+
+/** A device client: no cookies, just a bearer token — like a box on the shop floor. */
+function device(base = BASE) {
+  let token = "";
+  // Un boîtier n'a pas d'adresse « naturelle » : chaque client du test prend la sienne, sinon
+  // deux exécutions successives sur un serveur partagé se marchent sur le budget de l'appairage.
+  const ip = visitorIp();
+  async function call(path, body, headers = {}) {
+    const h = { "Content-Type": "application/json", "CF-Connecting-IP": ip, ...headers };
+    if (token) h.Authorization = "Bearer " + token;
+    const res = await fetch(base + path, { method: body === undefined ? "GET" : "POST", headers: h, body: body === undefined ? undefined : JSON.stringify(body) });
+    let data = null;
+    try { data = await res.json(); } catch (_) { /* not json */ }
+    // like the kiosk page: an answer that carries a token is kept and used from then on
+    if (data && data.token) token = data.token;
+    return { status: res.status, data };
+  }
+  return { call, set token(v) { token = v; }, get token() { return token; } };
+}
+
+test("journal piloté par la période et par le pointeur du direct", async () => {
+  const c = client();
+  await signup(c, "fitness");
+  const a = (await c.call("/api/members", { name: "Nour", subscription_end: today })).data;
+  const b = (await c.call("/api/members", { name: "Sofiane", subscription_end: today })).data;
+  await c.call(`/api/members/${a.id}/entry`, {});
+  await c.call(`/api/members/${b.id}/entry`, {});
+
+  const week = (await c.call("/api/state?days=7")).data;
+  assert.equal(week.chart.length, 7, "sept jours par défaut");
+  assert.equal(week.chart[6].count, 2);
+  assert.equal(week.period.days, 7);
+  assert.equal(week.period.granted, 2, "la période porte son propre total");
+  assert.equal(week.devices.count, 0, "aucun kiosque relié pour l'instant");
+  assert.equal(week.logs.length, 2);
+  const head = week.head;
+  assert.ok(head >= 1, "le journal expose son dernier identifiant");
+
+  const month = (await c.call("/api/state?days=30")).data;
+  assert.equal(month.chart.length, 30, "une fenêtre plus large pour un vrai graphique de SaaS");
+  assert.equal(month.chart[29].count, 2);
+  assert.equal(month.chart[0].count, 0);
+  const clamped = (await c.call("/api/state?days=99999")).data;
+  assert.equal(clamped.period.days, 90, "la fenêtre est bornée : pas de requête infinie");
+  const junk = (await c.call("/api/state?days=abc")).data;
+  assert.equal(junk.period.days, 7, "une valeur aberrante retombe sur la semaine");
+
+  // le direct : depuis le dernier identifiant vu, uniquement les nouveautés
+  const quiet = (await c.call("/api/state?since=" + head)).data;
+  assert.equal(quiet.logs.length, 0, "rien de neuf, rien à notifier");
+  assert.equal(quiet.head, head, "le pointeur n'avance pas tout seul");
+  await c.call(`/api/members/${a.id}/entry`, {});   // même personne : doublon de 60 s → rien
+  assert.equal((await c.call("/api/state?since=" + head)).data.logs.length, 0, "un doublon ne notifie personne");
+  const third = (await c.call("/api/members", { name: "Lila", subscription_end: today })).data;
+  await c.call(`/api/members/${third.id}/entry`, {});
+  const fresh = (await c.call("/api/state?since=" + head)).data;
+  assert.equal(fresh.logs.length, 1, "le passage de Lila arrive seul");
+  assert.equal(fresh.logs[0].name, "Lila");
+  assert.ok(fresh.head > head, "et le pointeur repart pour la fois suivante");
+});
+
+test("l'espace voit d'un coup d'œil combien de kiosques tournent", async () => {
+  const c = client();
+  await signup(c, "coworking");
+  const before = (await c.call("/api/state")).data.devices;
+  assert.deepEqual(before, { count: 0, online: 0 });
+  const code = (await c.call("/api/devices/pairing", { name: "Réception" })).data.code;
+  assert.equal((await c.call("/api/state")).data.devices.count, 0, "un code en attente n'est pas un appareil");
+  const d = device();
+  assert.equal((await d.call("/api/pair", { code })).status, 200);
+  assert.equal((await d.call("/api/device/state")).status, 200, "le kiosque bat");
+  const after = (await c.call("/api/state")).data.devices;
+  assert.equal(after.count, 1);
+  assert.equal(after.online, 1, "vu dans les deux minutes : en ligne");
+});
+
+test("appairage : le code est court, daté, utilisable une fois", async () => {
+  const c = client();
+  await signup(c, "fitness");
+  assert.equal((await client().call("/api/devices")).status, 401, "la liste des appareils demande une session");
+
+  const short = await c.call("/api/devices/pairing", { name: "x", kind: "kiosk" });
+  assert.equal(short.status, 400, "un nom d'une lettre ne suffit pas");
+  const made = await c.call("/api/devices/pairing", { name: "Borne entrée", kind: "box" });
+  assert.equal(made.status, 200, JSON.stringify(made.data));
+  const { code, link, expires_in: ttl } = made.data;
+  assert.match(code, /^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{6}$/, "6 caractères sans I/O/0/1, lisibles au téléphone");
+  assert.equal(ttl, 600, "10 minutes de validité");
+  assert.equal(link, `/kiosk?pair=${code}`, "le lien s'ouvre directement sur le kiosque");
+
+  const list = await c.call("/api/devices");
+  assert.equal(list.data.pairings.length, 1);
+  assert.ok(list.data.pairings[0].seconds_left > 500 && list.data.pairings[0].seconds_left <= 600);
+  assert.equal(list.data.pairings[0].name, "Borne entrée");
+
+  // a wrong code tells you nothing about which part was wrong
+  const nope = await device().call("/api/pair", { code: "ZZZZZZ" });
+  assert.equal(nope.status, 404);
+  // typing the link from the screen: case and spaces don't matter
+  const d = device();
+  const paired = await d.call("/api/pair", { code: code.toLowerCase().split("").join(" ") });
+  assert.equal(paired.status, 200, JSON.stringify(paired.data));
+  assert.match(paired.data.token, /^[A-Za-z0-9_-]{40,}$/, "un jeton d'appareil, jamais un cookie de session");
+  assert.equal(paired.data.device.kind, "box");
+  assert.match(paired.data.message, /relié à/);
+
+  // single use: the same code cannot open a second device
+  const again = await device().call("/api/pair", { code });
+  assert.equal(again.status, 404, "un code sert une fois");
+  assert.equal((await c.call("/api/devices")).data.pairings.length, 0);
+
+  const devices = (await c.call("/api/devices")).data.devices;
+  assert.equal(devices.length, 1);
+  assert.equal(devices[0].name, "Borne entrée");
+  assert.equal(devices[0].token_hash, undefined, "le jeton n'est jamais renvoyé une 2e fois");
+
+  // cancelling a code that was never used
+  const spare = await c.call("/api/devices/pairing", { name: "Tablette accueil" });
+  assert.equal(spare.status, 200);
+  assert.equal((await c.call("/api/devices/pairing/cancel", { code: spare.data.code })).status, 200);
+  assert.equal((await c.call("/api/devices")).data.pairings.length, 0);
+  assert.equal((await device().call("/api/pair", { code: spare.data.code })).status, 404);
+});
+
+test("un appareil lié fait le kiosque, rien d'autre", async () => {
+  const c = client();
+  await signup(c, "canteen");
+  const mine = (await c.call("/api/members", { name: "Nadia", subscription_end: today })).data;
+  const gone = (await c.call("/api/members", { name: "Hakim", subscription_end: yesterday })).data;
+  const faceless = (await c.call("/api/members", { name: "Karim", subscription_end: today })).data;
+  await c.call(`/api/members/${mine.id}/enroll`, { descriptor: descriptor(11), consent: true });
+  await c.call(`/api/members/${gone.id}/enroll`, { descriptor: descriptor(12), consent: true });
+  const code = (await c.call("/api/devices/pairing", { name: "Borne self", kind: "kiosk" })).data.code;
+
+  const d = device();
+  const paired = await d.call("/api/pair", { code, name: "Borne self (hall)" });
+  assert.equal(paired.status, 200, JSON.stringify(paired.data));
+  assert.equal(paired.data.device.name, "Borne self (hall)", "l'appareil peut se donner son propre nom");
+  const org = (await c.call("/api/state")).data.org;
+  assert.equal(paired.data.org.name, org.name);
+
+  const state = await d.call("/api/device/state");
+  assert.equal(state.status, 200);
+  assert.equal(state.data.sector.rule, "one_per_day");
+  assert.equal(state.data.members, undefined, "pas la liste des adhérents");
+  assert.equal(state.data.settings, undefined, "pas les réglages de l'espace");
+  assert.equal(state.data.device.kind_label, "Kiosque d'entrée");
+
+  const feed = await d.call("/api/device/descriptors");
+  assert.equal(feed.status, 200);
+  assert.equal(feed.data.members.length, 2, "les visages consentis, uniquement ceux de cet espace");
+  assert.equal(feed.data.members.some((m) => m.id === faceless.id), false, "un membre sans consentement ne descend jamais dans un kiosque");
+  assert.equal(feed.data.members[0].name, "Nadia");
+  assert.equal(feed.data.members[0].d.length, 128);
+
+  const ok = await d.call("/api/device/recognized", { member_id: mine.id, distance: 0.2 });
+  assert.equal(ok.status, 200, JSON.stringify(ok.data));
+  assert.equal(ok.data.status, "granted");
+  const expired = await d.call("/api/device/recognized", { member_id: gone.id, distance: 0.2 });
+  assert.equal(expired.status, 403);
+  assert.equal(expired.data.status, "expired");
+  // a face that lingers in front of the lens must not be counted twice
+  const twice = await d.call("/api/device/recognized", { member_id: mine.id, distance: 0.2 });
+  assert.equal(twice.status, 200);
+  assert.match(twice.data.message, /moins d'une minute/, "le doublon est annoncé, pas compté");
+
+  const manual = await d.call("/api/device/entry", { member_id: gone.id });
+  assert.equal(manual.status, 409, "abonnement expiré : le kiosque ne peut pas forcer le passage");
+  const stranger = await d.call("/api/device/entry", { member_id: faceless.id });
+  assert.equal(stranger.status, 200, "le poste d'accueil peut pointer un sans-visage, avec la règle du jour");
+  const again = await d.call("/api/device/entry", { member_id: faceless.id });
+  assert.equal(again.status, 200);
+  assert.match(again.data.message, /moins d'une minute/, "deux scans d'affilée ne comptent pas deux passages");
+
+  // what the kiosk did is visible to the human in charge, with the device's name
+  const logs = (await c.call("/api/state")).data.logs;
+  assert.equal(logs.length, 3);
+  assert.deepEqual(logs.map((l) => l.device_name), ["Borne self (hall)", "Borne self (hall)", "Borne self (hall)"], "chaque ligne dit d'où elle vient");
+  assert.equal(logs[0].method, "Manuel", "le plus récent en premier : pointage manuel de Karim");
+  assert.equal(logs[1].method, "Facial");
+  assert.equal(logs[1].status, "refused", "le passage refusé par le kiosque reste lisible dans le journal");
+
+  // and this is where the kiosk stops: no admin route accepts a device token
+  for (const path of ["/api/state", "/api/descriptors", "/api/members", "/api/devices", "/api/settings", `/api/members/${mine.id}/delete`, `/api/members/${mine.id}/renew`]) {
+    const r = await d.call(path);
+    assert.equal(r.status, 401, `${path} doit rester interdit à un appareil`);
+  }
+  const forged = device();
+  forged.token = d.token.slice(0, -3) + "AAA";
+  assert.equal((await forged.call("/api/device/state")).status, 401, "un jeton tronqué ne vaut rien");
+  const rival = device();
+  rival.token = d.token;
+  assert.equal((await rival.call("/api/device/state")).status, 200, "même jeton, même kiosque : c'est bien le jeton qui authentifie");
+});
+
+test("révocation immédiate, et un appareil d'un autre espace ne passe pas", async () => {
+  const a = client(); const b = client();
+  await signup(a, "fitness"); await signup(b, "office");
+  const codeA = (await a.call("/api/devices/pairing", { name: "Kiosque A" })).data.code;
+  const d = device();
+  assert.equal((await d.call("/api/pair", { code: codeA })).status, 200);
+  // B cannot mint a code that would hijack A's device list
+  assert.equal((await b.call("/api/devices")).data.devices.length, 0);
+  const other = (await b.call("/api/devices/pairing", { name: "Kiosque B" })).data.code;
+  assert.notEqual(other, codeA);
+  // B cannot revoke A's device
+  const idA = (await a.call("/api/devices")).data.devices[0].id;
+  assert.equal((await b.call(`/api/devices/${idA}/revoke`, {})).status, 404, "un autre espace ne peut pas débrancher cet appareil");
+
+  const ren = await a.call(`/api/devices/${idA}/rename`, { name: "Borne arrière" });
+  assert.equal(ren.status, 200);
+  assert.equal((await a.call("/api/devices")).data.devices[0].name, "Borne arrière");
+  assert.equal((await d.call("/api/device/state")).status, 200, "renommer ne déconnecte pas l'appareil");
+
+  assert.equal((await a.call(`/api/devices/${idA}/revoke`, {})).status, 200);
+  assert.equal((await d.call("/api/device/state")).status, 401, "jeton révoqué : plus rien ne passe");
+  assert.equal((await d.call("/api/device/descriptors")).status, 401);
+  const revoked = (await a.call("/api/devices")).data.devices[0];
+  assert.match(String(revoked.revoked_at), /^20\d\d-\d\d-\d\dT/, "la ligne garde la trace de la révocation");
+});
+
+test("un boîtier de caméra envoie sans en-tête d'origine, un navigateur inter-site non", async () => {
+  const c = client();
+  await signup(c, "office");
+  const code = (await c.call("/api/devices/pairing", { name: "Caméra entrée" })).data.code;
+  // curl / a relay on a camera: no Origin, no Sec-Fetch-Site
+  const relayIp = visitorIp();
+  const raw = await fetch(BASE + "/api/pair", { method: "POST", headers: { "Content-Type": "application/json", "CF-Connecting-IP": relayIp }, body: JSON.stringify({ code, kind: "box" }) });
+  assert.equal(raw.status, 200, "une machine sans en-têtes de navigateur doit pouvoir s'appairer");
+  const token = (await raw.json()).token;
+  assert.match(token, /^[A-Za-z0-9_-]{40,}$/);
+  // a page on another domain may not spend it, even with a valid code
+  const spare = (await c.call("/api/devices/pairing", { name: "Caméra 2" })).data.code;
+  const evil = await fetch(BASE + "/api/pair", { method: "POST", headers: { "Content-Type": "application/json", Origin: "https://evil.example", "Sec-Fetch-Site": "cross-site" }, body: JSON.stringify({ code: spare }) });
+  assert.equal(evil.status, 403, "un site tiers ne peut pas dépenser les codes d'appairage");
+  // and a revoked-but-still-typed code stays unusable
+  assert.equal((await fetch(BASE + "/api/pair", { method: "POST", headers: { "Content-Type": "application/json", "CF-Connecting-IP": relayIp }, body: JSON.stringify({ code: spare }) })).status, 200);
+});
+
+test("15 codes devinés par adresse, puis on attend", async () => {
+  const c = client();
+  await signup(c, "fitness");
+  const ip = visitorIp();
+  let last;
+  for (let i = 0; i < 20; i++) {
+    last = await fetch(BASE + "/api/pair", { method: "POST", headers: { "Content-Type": "application/json", Origin: BASE, "CF-Connecting-IP": ip }, body: JSON.stringify({ code: "AAAAAA" }) });
+    await last.json().catch(() => null);
+    if (last.status === 429) break;
+  }
+  assert.equal(last.status, 429, "le budget de devinette est vite épuisé");
 });

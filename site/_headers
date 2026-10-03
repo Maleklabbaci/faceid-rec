@@ -7,6 +7,9 @@
 /app
   Cache-Control: no-store
 
+/kiosk
+  Cache-Control: no-store
+
 /models/*
   Cache-Control: public, max-age=31536000, immutable
 

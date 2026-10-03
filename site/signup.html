@@ -10,11 +10,12 @@
 <main class="auth-wrap">
   <a class="brand" href="/"><span class="logo">F</span> FaceID Platform</a>
   <section class="card auth-card">
+    <p class="eyebrow">Essai gratuit, sans carte bancaire</p>
     <h1>Créer l'espace de votre entreprise</h1>
     <p class="flash" id="flash" hidden></p>
     <form id="auth-form" data-endpoint="/api/signup">
       <label>Nom de l'entreprise
-        <input name="company" required maxlength="100" placeholder="Ex. : Salle Olympia">
+        <input name="company" required maxlength="100" placeholder="Ex. : Salle Olympia" autofocus>
       </label>
       <label>Secteur d'activité
         <select name="sector" required id="sector-select">
@@ -23,6 +24,7 @@
           <option value="coworking">Coworking & centres de formation</option>
           <option value="canteen">Cantines & écoles privées</option>
         </select>
+        <span class="muted small">Le secteur choisit le vocabulaire, les indicateurs et la règle d'accès. Modifiable ensuite.</span>
       </label>
       <label>Email professionnel
         <input type="email" name="email" required maxlength="254" autocomplete="username">
@@ -30,10 +32,18 @@
       <label>Mot de passe <span class="muted small">(12 caractères minimum)</span>
         <input type="password" name="password" required minlength="12" maxlength="256" autocomplete="new-password">
       </label>
-      <button class="btn btn-primary btn-block" type="submit">Créer mon espace</button>
+      <button class="btn btn-primary btn-block btn-lg" type="submit">Créer mon espace</button>
     </form>
-    <p class="muted small">Déjà un compte ? <a href="/login">Se connecter</a></p>
+    <div class="auth-foot">
+      <span class="muted small">Déjà un compte ?</span>
+      <a class="btn btn-ghost btn-sm" href="/login">Se connecter</a>
+    </div>
   </section>
+  <ul class="hero-points">
+    <li>Votre espace, votre devise, votre fuseau horaire</li>
+    <li>Empreintes faciales effaçables à tout moment</li>
+    <li>Un kiosque à relier sur n'importe quel écran</li>
+  </ul>
 </main>
 <script src="/assets/auth.js" defer></script>
 </body>
