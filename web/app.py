@@ -11,16 +11,19 @@ from datetime import date, datetime, timedelta, timezone
 from functools import wraps
 from pathlib import Path
 
-from flask import Flask, abort, flash, g, jsonify, redirect, render_template, request, session, url_for
+from flask import Flask, abort, flash, g, jsonify, make_response, redirect, render_template, request, session, url_for
 from PIL import Image, UnidentifiedImageError
 from werkzeug.security import check_password_hash, generate_password_hash
 
 SECTORS = {"fitness": "Sport & fitness", "education": "Éducation", "coworking": "Coworking", "enterprise": "Entreprises", "leisure": "Loisirs"}
+TOLERANCE = 0.5          # same threshold as the desktop app
+MIN_FACE_HEIGHT = 50     # pixels, on a 640px-wide frame: rejects faces too far from the camera
+DUPLICATE_WINDOW = 60    # seconds: one logged entry per member within this window
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS organizations(id INTEGER PRIMARY KEY, name TEXT NOT NULL, sector TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL REFERENCES organizations(id), email TEXT UNIQUE NOT NULL, password TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS members(id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL REFERENCES organizations(id), name TEXT NOT NULL, email TEXT NOT NULL DEFAULT '', subscription_end TEXT NOT NULL, encoding TEXT, consent_at TEXT, UNIQUE(org_id,id));
-CREATE TABLE IF NOT EXISTS entries(id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL, member_id INTEGER NOT NULL, actor_id INTEGER NOT NULL REFERENCES users(id), created_at TEXT NOT NULL, method TEXT NOT NULL, FOREIGN KEY(org_id,member_id) REFERENCES members(org_id,id) ON DELETE CASCADE);
+CREATE TABLE IF NOT EXISTS entries(id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL, member_id INTEGER NOT NULL, actor_id INTEGER NOT NULL REFERENCES users(id), created_at TEXT NOT NULL, method TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'granted', FOREIGN KEY(org_id,member_id) REFERENCES members(org_id,id) ON DELETE CASCADE);
 CREATE INDEX IF NOT EXISTS members_org ON members(org_id);
 CREATE INDEX IF NOT EXISTS entries_org ON entries(org_id);
 """
@@ -38,7 +41,19 @@ def create_app(config=None):
                 f.write(secrets.token_hex(32))
         except FileExistsError:
             pass
-    app.config.update(SECRET_KEY=os.environ.get("SECRET_KEY") or key_path.read_text(), DATABASE=os.environ.get("WEB_DATABASE") or str(Path(app.instance_path) / "web.db"), MAX_CONTENT_LENGTH=3 * 1024 * 1024, SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax", SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE", "1") == "1", PERMANENT_SESSION_LIFETIME=timedelta(hours=8))
+    # EMBED_PREVIEW=1: the app is shown inside another site's iframe (hosted preview).
+    # Cookies must then be SameSite=None; Secure and framing must be allowed.
+    embed = os.environ.get("EMBED_PREVIEW") == "1"
+    app.config.update(
+        SECRET_KEY=os.environ.get("SECRET_KEY") or key_path.read_text(),
+        DATABASE=os.environ.get("WEB_DATABASE") or str(Path(app.instance_path) / "web.db"),
+        MAX_CONTENT_LENGTH=3 * 1024 * 1024,
+        SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_SAMESITE="None" if embed else "Lax",
+        SESSION_COOKIE_SECURE=True if embed else os.environ.get("COOKIE_SECURE", "1") == "1",
+        PERMANENT_SESSION_LIFETIME=timedelta(hours=8),
+        ALLOW_EMBED=embed,
+    )
     if config:
         app.config.update(config)
     limits = defaultdict(deque)
@@ -53,6 +68,8 @@ def create_app(config=None):
     with app.app_context():
         db().execute("PRAGMA journal_mode=WAL")
         db().executescript(SCHEMA)
+        if "status" not in [r[1] for r in db().execute("PRAGMA table_info(entries)")]:
+            db().execute("ALTER TABLE entries ADD COLUMN status TEXT NOT NULL DEFAULT 'granted'")
         db().commit()
 
     @app.teardown_appcontext
@@ -76,7 +93,10 @@ def create_app(config=None):
     def headers(response):
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "same-origin"
-        response.headers["Content-Security-Policy"] = "default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; media-src 'self' blob:; connect-src 'self'; frame-ancestors 'self'; form-action 'self'; base-uri 'self'"
+        csp = "default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; media-src 'self' blob:; connect-src 'self'; form-action 'self'; base-uri 'self'"
+        if not app.config["ALLOW_EMBED"]:
+            csp += "; frame-ancestors 'self'"
+        response.headers["Content-Security-Policy"] = csp
         response.headers["Permissions-Policy"] = "camera=(self)"
         if g.user or request.path in ("/login", "/signup"):
             response.headers["Cache-Control"] = "no-store"
@@ -94,7 +114,7 @@ def create_app(config=None):
         while q and q[0] < now - seconds:
             q.popleft()
         if len(q) >= count:
-            abort(429, "Trop de tentatives. Réessayez plus tard.")
+            abort(429, "Trop de tentatives. Réessayez dans une minute.")
         q.append(now)
 
     def auth(fn):
@@ -119,11 +139,21 @@ def create_app(config=None):
         except (ValueError, TypeError):
             abort(400, "Date invalide.")
 
-    def entry(row, method):
-        if row["subscription_end"] < date.today().isoformat():
-            abort(409, "Abonnement expiré : entrée refusée.")
-        db().execute("INSERT INTO entries(org_id,member_id,actor_id,created_at,method) VALUES(?,?,?,?,?)", (g.user["org_id"], row["id"], g.user["id"], datetime.now(timezone.utc).isoformat(), method))
-        db().commit()
+    def api_fail(code, status, message, **extra):
+        abort(make_response(jsonify(status=status, message=message, **extra), code))
+
+    def record(row, method):
+        """Log an access attempt for a member. Returns (granted, duplicate)."""
+        granted = row["subscription_end"] >= date.today().isoformat()
+        now = datetime.now(timezone.utc)
+        duplicate = False
+        if granted:
+            since = (now - timedelta(seconds=DUPLICATE_WINDOW)).isoformat()
+            duplicate = db().execute("SELECT 1 FROM entries WHERE org_id=? AND member_id=? AND status='granted' AND created_at>=?", (g.user["org_id"], row["id"], since)).fetchone() is not None
+        if not duplicate:
+            db().execute("INSERT INTO entries(org_id,member_id,actor_id,created_at,method,status) VALUES(?,?,?,?,?,?)", (g.user["org_id"], row["id"], g.user["id"], now.isoformat(), method, "granted" if granted else "refused"))
+            db().commit()
+        return granted, duplicate
 
     @app.get("/")
     def index():
@@ -177,17 +207,17 @@ def create_app(config=None):
     def dashboard(page="overview"):
         if page not in ("overview", "members", "access", "settings"):
             abort(404)
-        rows = db().execute("SELECT id,name,email,subscription_end,consent_at FROM members WHERE org_id=? ORDER BY id DESC", (g.user["org_id"],)).fetchall()
-        logs = db().execute("SELECT entries.*,members.name FROM entries JOIN members ON members.id=entries.member_id AND members.org_id=entries.org_id WHERE entries.org_id=? ORDER BY entries.id DESC LIMIT 30", (g.user["org_id"],)).fetchall()
+        org = g.user["org_id"]
+        rows = db().execute("SELECT id,name,email,subscription_end,consent_at FROM members WHERE org_id=? ORDER BY id DESC", (org,)).fetchall()
+        logs = db().execute("SELECT entries.*,members.name FROM entries JOIN members ON members.id=entries.member_id AND members.org_id=entries.org_id WHERE entries.org_id=? ORDER BY entries.id DESC LIMIT 30", (org,)).fetchall()
         today = date.today().isoformat()
         active = sum(r["subscription_end"] >= today for r in rows)
-        visits = db().execute("SELECT COUNT(*) FROM entries WHERE org_id=? AND substr(created_at,1,10)=?", (g.user["org_id"], today)).fetchone()[0]
-        chart = []
-        for offset in range(6, -1, -1):
-            day = (date.today() - timedelta(days=offset)).isoformat()
-            n = db().execute("SELECT COUNT(*) FROM entries WHERE org_id=? AND substr(created_at,1,10)=?", (g.user["org_id"], day)).fetchone()[0]
-            chart.append({"day": day[5:], "count": n})
-        return render_template("dashboard.html", page=page, members=rows, logs=logs, active=active, visits=visits, today=today, chart=chart, chart_max=max([c["count"] for c in chart] + [1]))
+
+        def count(status, day):
+            return db().execute("SELECT COUNT(*) FROM entries WHERE org_id=? AND status=? AND substr(created_at,1,10)=?", (org, status, day)).fetchone()[0]
+
+        chart = [{"day": (date.today() - timedelta(days=o)).isoformat()[5:], "count": count("granted", (date.today() - timedelta(days=o)).isoformat())} for o in range(6, -1, -1)]
+        return render_template("dashboard.html", page=page, members=rows, logs=logs, active=active, visits=count("granted", today), refused=count("refused", today), today=today, chart=chart, chart_max=max([c["count"] for c in chart] + [1]))
 
     @app.post("/members")
     @auth
@@ -224,8 +254,11 @@ def create_app(config=None):
     @app.post("/members/<int:member_id>/entry")
     @auth
     def manual_entry(member_id):
-        entry(member(member_id), "Manuel")
-        flash("Entrée enregistrée par l’administrateur.", "success")
+        row = member(member_id)
+        if row["subscription_end"] < date.today().isoformat():
+            abort(409, "Abonnement expiré : entrée refusée.")
+        _, duplicate = record(row, "Manuel")
+        flash("Entrée déjà enregistrée il y a moins d’une minute." if duplicate else "Entrée enregistrée par l’administrateur.", "success")
         return redirect(url_for("dashboard", page="access"))
 
     @app.post("/members/<int:member_id>/consent/revoke")
@@ -249,63 +282,78 @@ def create_app(config=None):
         flash("Votre espace a été personnalisé.", "success")
         return redirect(url_for("dashboard", page="settings"))
 
-    def face_encoding():
-        limited("face", 12)
+    def detect_face(single):
+        """Decode the posted frame and return (encoding, face_recognition, numpy) for the main face."""
         try:
             import face_recognition
             import numpy as np
         except ImportError:
-            abort(503, "Module facial non installé sur ce serveur. Le contrôle manuel reste disponible.")
+            api_fail(503, "error", "Moteur facial non installé sur ce serveur (voir README). Le contrôle manuel reste disponible.")
         body = request.get_json(silent=True) or {}
         try:
-            raw = base64.b64decode(body.get("image", "").split(",")[-1], validate=True)
+            raw = base64.b64decode(str(body.get("image", "")).split(",")[-1], validate=True)
             image = Image.open(io.BytesIO(raw))
             if image.width * image.height > 4_000_000:
-                abort(400, "Image trop grande.")
+                api_fail(400, "error", "Image trop grande.")
             image = image.convert("RGB")
             image.thumbnail((640, 480))
-            encodings = face_recognition.face_encodings(np.array(image))
+            frame = np.ascontiguousarray(np.array(image))
+            boxes = face_recognition.face_locations(frame)
         except (ValueError, UnidentifiedImageError, OSError, Image.DecompressionBombError):
-            abort(400, "Image invalide.")
-        if len(encodings) != 1:
-            abort(400, "Présentez exactement un visage face à la caméra.")
-        return encodings[0], face_recognition, np
+            api_fail(400, "error", "Image invalide.")
+        if not boxes:
+            api_fail(422, "no_face", "Aucun visage détecté. Placez-vous face à la caméra.")
+        if single and len(boxes) > 1:
+            api_fail(422, "multi_face", "Plusieurs visages détectés : une seule personne à la fois pour l’enregistrement.")
+        top, right, bottom, left = max(boxes, key=lambda b: (b[2] - b[0]) * (b[1] - b[3]))
+        if bottom - top < MIN_FACE_HEIGHT:
+            api_fail(422, "no_face", "Visage trop éloigné : approchez-vous de la caméra.")
+        encoding = face_recognition.face_encodings(frame, known_face_locations=[(top, right, bottom, left)])[0]
+        return encoding, face_recognition, np
 
     @app.post("/api/members/<int:member_id>/enroll")
     @auth
     def enroll(member_id):
-        member(member_id)
+        row = member(member_id)
         if (request.get_json(silent=True) or {}).get("consent") is not True:
-            abort(400, "Consentement explicite requis.")
-        encoding, _, _ = face_encoding()
+            api_fail(400, "error", "Consentement explicite requis.")
+        limited("enroll", 20)
+        encoding, _, _ = detect_face(single=True)
         db().execute("UPDATE members SET encoding=?,consent_at=? WHERE id=? AND org_id=?", (json.dumps(encoding.tolist()), datetime.now(timezone.utc).isoformat(), member_id, g.user["org_id"]))
         db().commit()
-        return jsonify(message="Visage enregistré avec consentement (version du texte : MVP-1).")
+        return jsonify(status="ok", message=f"Visage de {row['name']} enregistré avec consentement.")
 
     @app.post("/api/recognize")
     @auth
     def recognize():
-        encoding, engine, np = face_encoding()
+        limited("recognize", 90)
+        encoding, engine, np = detect_face(single=False)
         rows = db().execute("SELECT * FROM members WHERE org_id=? AND encoding IS NOT NULL AND consent_at IS NOT NULL", (g.user["org_id"],)).fetchall()
         if not rows:
-            abort(404, "Aucun visage enregistré dans votre entreprise.")
+            api_fail(404, "unknown", "Aucun visage enregistré dans votre espace : enregistrez d’abord vos membres (page Membres).")
         distances = engine.face_distance([np.array(json.loads(r["encoding"])) for r in rows], encoding)
         idx = int(np.argmin(distances))
-        if distances[idx] > 0.5:
-            abort(404, "Visage non reconnu.")
-        entry(rows[idx], "Facial · test")
-        return jsonify(message=f"{rows[idx]['name']} : présence enregistrée. Aucune porte n’a été actionnée.")
+        if distances[idx] > TOLERANCE:
+            api_fail(404, "unknown", "Visage non reconnu : accès refusé.")
+        row = rows[idx]
+        granted, duplicate = record(row, "Facial")
+        if not granted:
+            api_fail(403, "expired", f"{row['name']} : abonnement expiré le {row['subscription_end']}, accès refusé.", name=row["name"])
+        suffix = " (passage déjà enregistré)" if duplicate else ""
+        return jsonify(status="granted", name=row["name"], message=f"{row['name']} : accès autorisé{suffix}.", confidence=round(float(1 - distances[idx]), 2))
 
     @app.errorhandler(400)
     @app.errorhandler(401)
+    @app.errorhandler(403)
     @app.errorhandler(404)
     @app.errorhandler(409)
     @app.errorhandler(413)
+    @app.errorhandler(422)
     @app.errorhandler(429)
     @app.errorhandler(503)
     def error(exc):
         if request.path.startswith("/api/"):
-            return jsonify(message=exc.description), exc.code
+            return jsonify(status="error", message=exc.description), exc.code
         return render_template("error.html", error=exc), exc.code
 
     return app

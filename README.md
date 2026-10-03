@@ -19,13 +19,29 @@ COOKIE_SECURE=0 python -m web.wsgi                      # http://localhost:5000
 ```
 `COOKIE_SECURE=0` n'est nécessaire qu'en HTTP local. En production (HTTPS) ne le mettez pas.
 
-Pour activer la reconnaissance faciale côté serveur, installez en plus `pip install -r requirements.txt` (dlib / face_recognition). Sans ces modules, la plateforme fonctionne quand même : seules les actions « Enregistrer le visage » et « Vérifier l'accès » renvoient un message « module facial non installé », tout le reste (membres, abonnements, entrées manuelles, journal) reste utilisable.
+### Moteur facial (le même que l'application bureau)
+```bash
+pip install dlib-bin numpy
+pip install --no-deps face_recognition face_recognition_models
+```
+`dlib-bin` fournit dlib précompilé (Windows / Linux / macOS), ce qui évite CMake et Visual Studio. Sans ces modules, la plateforme fonctionne quand même : seules les actions « Enregistrer le visage » et « Vérifier » renvoient « moteur facial non installé », tout le reste (membres, abonnements, entrées manuelles, journal) reste utilisable.
+
+Pour vérifier le moteur sur votre serveur avec une vraie photo :
+```bash
+FACE_TEST_IMAGE=/chemin/photo.jpg python -m pytest -q tests -k real_face
+```
+
+### Aperçu intégré (iframe) ou hébergeur de test
+```bash
+EMBED_PREVIEW=1 python -m web.wsgi
+```
+Autorise l'affichage dans une iframe d'un autre site (cookies `SameSite=None; Secure`). **La caméra exige HTTPS** ; si la fenêtre intégrée bloque la caméra, la page propose un lien « Ouvrir dans un nouvel onglet ».
 
 ### Fonctionnalités
 - **Espace privé par entreprise (multi-tenant)** : inscription avec nom + secteur, chaque compte ne voit que ses propres membres et passages (vérifié par tests).
 - **Secteurs** : Sport & fitness, Éducation, Coworking, Entreprises, Loisirs — l'espace change de couleurs selon le secteur, modifiable dans Paramètres.
 - **Membres & abonnements** : ajout, date de fin, statut Actif/Expiré, renouvellement, suppression (efface aussi l'historique et les données biométriques).
-- **Contrôle d'accès** : entrée manuelle (sans caméra) ou reconnaissance faciale depuis la caméra du navigateur ; un abonnement expiré est refusé (HTTP 409).
+- **Contrôle d'accès (kiosque)** : caméra du navigateur en mode automatique (vérification toutes les 1,5 s, bandeau vert/orange/rouge), ou entrée manuelle sans caméra. Abonnement expiré = refus journalisé ; un même membre n'est compté qu'une fois par minute ; le plus grand visage est retenu si plusieurs personnes passent devant la caméra.
 - **Journal & tableau de bord** : membres actifs, passages du jour, graphique 7 jours, derniers passages.
 - **Biométrie avec consentement** : l'empreinte faciale n'est enregistrée qu'après une case de consentement explicite, et peut être effacée à tout moment.
 

@@ -159,3 +159,46 @@ def test_security_headers(client):
     assert r.headers["X-Content-Type-Options"] == "nosniff"
     signup(client, "a@b.c")
     assert client.get("/app").headers["Cache-Control"] == "no-store"
+
+
+def test_duplicate_manual_entry_suppressed(client):
+    signup(client, "a@b.c")
+    add_member(client, "Yacine", (date.today() + timedelta(days=10)).isoformat())
+    (mid,) = member_ids(client)
+    token = csrf_of(client, "/app")
+    first = client.post(f"/members/{mid}/entry", data={"csrf": token}, follow_redirects=True).get_data(as_text=True)
+    second = client.post(f"/members/{mid}/entry", data={"csrf": token}, follow_redirects=True).get_data(as_text=True)
+    assert "Entrée enregistrée" in first and "déjà enregistrée" in second
+    assert second.count("Autorisé</span>") == 1  # journal shows a single granted row
+    assert ">1<" in client.get("/app").get_data(as_text=True)  # "Passages aujourd'hui" = 1
+
+
+def test_api_json_statuses_without_face(client):
+    signup(client, "a@b.c")
+    token = csrf_of(client, "/app")
+    r = client.post("/api/recognize", json={"image": "nope"}, headers={"X-CSRF-Token": token})
+    assert r.status_code in (400, 503) and r.get_json()["status"] == "error"
+    r = client.post("/api/recognize", json={}, headers={"X-CSRF-Token": "bad"})
+    assert r.status_code == 400 and "message" in r.get_json()
+
+
+@pytest.mark.skipif(not __import__("os").environ.get("FACE_TEST_IMAGE"), reason="set FACE_TEST_IMAGE=/path/photo.jpg to run the real face engine")
+def test_real_face_enroll_and_recognize(client):
+    import base64
+    pytest.importorskip("face_recognition")
+    photo = __import__("os").environ["FACE_TEST_IMAGE"]
+    data = "data:image/jpeg;base64," + base64.b64encode(open(photo, "rb").read()).decode()
+    signup(client, "a@b.c")
+    add_member(client, "Personne Test", (date.today() + timedelta(days=10)).isoformat())
+    (mid,) = member_ids(client)
+    token = csrf_of(client, "/app")
+    r = client.post(f"/api/members/{mid}/enroll", json={"consent": True, "image": data}, headers={"X-CSRF-Token": token})
+    assert r.status_code == 200, r.get_json()
+    r = client.post("/api/recognize", json={"image": data}, headers={"X-CSRF-Token": token})
+    assert r.status_code == 200 and r.get_json()["status"] == "granted" and r.get_json()["name"] == "Personne Test"
+    # Expired subscription: recognized but refused, and logged as refused
+    client.post(f"/members/{mid}/renew", data={"csrf": token, "subscription_end": (date.today() - timedelta(days=1)).isoformat()})
+    r = client.post("/api/recognize", json={"image": data}, headers={"X-CSRF-Token": token})
+    assert r.status_code == 403 and r.get_json()["status"] == "expired"
+    page = client.get("/app/access").get_data(as_text=True)
+    assert "Refusé</span>" in page and "Autorisé</span>" in page

@@ -36,6 +36,7 @@
         <div class="stat"><span class="stat-label">Abonnements actifs</span><span class="stat-value ok">{{ active }}</span></div>
         <div class="stat"><span class="stat-label">Expirés</span><span class="stat-value warn">{{ members|length - active }}</span></div>
         <div class="stat"><span class="stat-label">Passages aujourd'hui</span><span class="stat-value">{{ visits }}</span></div>
+        <div class="stat"><span class="stat-label">Refus aujourd'hui</span><span class="stat-value warn">{{ refused }}</span></div>
       </div>
       <section class="card">
         <h2>Passages sur 7 jours</h2>
@@ -52,10 +53,10 @@
         <h2>Derniers passages</h2>
         {% if logs %}
           <table>
-            <thead><tr><th>Membre</th><th>Méthode</th><th>Date (UTC)</th></tr></thead>
+            <thead><tr><th>Membre</th><th>Méthode</th><th>Résultat</th><th>Date (UTC)</th></tr></thead>
             <tbody>
               {% for l in logs[:10] %}
-                <tr><td>{{ l.name }}</td><td>{{ l.method }}</td><td>{{ l.created_at[:16]|replace('T', ' ') }}</td></tr>
+                <tr><td>{{ l.name }}</td><td>{{ l.method }}</td><td>{% if l.status == 'granted' %}<span class="badge badge-ok">Autorisé</span>{% else %}<span class="badge badge-warn">Refusé</span>{% endif %}</td><td>{{ l.created_at[:16]|replace('T', ' ') }}</td></tr>
               {% endfor %}
             </tbody>
           </table>
@@ -122,7 +123,7 @@
       <dialog id="enroll-dialog" class="dialog">
         <h2>Enregistrer le visage de <span id="enroll-name"></span></h2>
         <p class="muted small">La personne doit être présente et donner son accord. L'empreinte faciale est stockée dans l'espace de votre entreprise uniquement et peut être effacée à tout moment.</p>
-        <video id="enroll-video" autoplay playsinline muted></video>
+        <div class="video-wrap"><video id="enroll-video" autoplay playsinline muted></video></div>
         <label class="consent"><input type="checkbox" id="enroll-consent"> La personne consent à l'enregistrement de son visage pour le contrôle d'accès.</label>
         <p id="enroll-status" class="status" aria-live="polite"></p>
         <div class="dialog-actions">
@@ -134,15 +135,23 @@
     {% elif page == 'access' %}
       <h1>Contrôle d'accès</h1>
       <div class="two-cols">
-        <section class="card">
+        <section class="card kiosk">
           <h2>Reconnaissance faciale</h2>
-          <p class="muted small">Mode test : vérifie l'abonnement et enregistre le passage. Aucun équipement (porte, tourniquet) n'est actionné depuis le navigateur.</p>
-          <video id="rec-video" autoplay playsinline muted></video>
-          <p id="rec-status" class="status" aria-live="polite"></p>
-          <div class="dialog-actions">
-            <button class="btn btn-ghost" type="button" id="rec-start">Activer la caméra</button>
-            <button class="btn btn-primary" type="button" id="rec-check" data-url="{{ url_for('recognize') }}" disabled>Vérifier l'accès</button>
+          <p class="muted small">Activez la caméra puis le mode automatique : chaque visage est vérifié en continu, l'abonnement contrôlé et le passage journalisé. Aucune porte n'est actionnée depuis le navigateur (boîtier sur site à venir).</p>
+          <div class="video-wrap">
+            <video id="rec-video" autoplay playsinline muted></video>
+            <div id="rec-banner" class="banner banner-idle" aria-live="assertive">
+              <strong id="rec-banner-title">Caméra inactive</strong>
+              <span id="rec-banner-text">Cliquez sur « Activer la caméra ».</span>
+            </div>
           </div>
+          <p id="rec-status" class="status" aria-live="polite"></p>
+          <div class="kiosk-controls">
+            <button class="btn btn-ghost" type="button" id="rec-start">Activer la caméra</button>
+            <button class="btn btn-primary" type="button" id="rec-check" data-url="{{ url_for('recognize') }}" disabled>Vérifier maintenant</button>
+            <label class="switch"><input type="checkbox" id="rec-auto" disabled> Mode automatique (kiosque)</label>
+          </div>
+          <ul id="rec-live" class="live-list" aria-label="Derniers résultats"></ul>
         </section>
         <section class="card">
           <h2>Entrée manuelle</h2>
@@ -168,10 +177,10 @@
         <h2>Journal des passages</h2>
         {% if logs %}
           <table>
-            <thead><tr><th>Membre</th><th>Méthode</th><th>Date (UTC)</th></tr></thead>
+            <thead><tr><th>Membre</th><th>Méthode</th><th>Résultat</th><th>Date (UTC)</th></tr></thead>
             <tbody>
               {% for l in logs %}
-                <tr><td>{{ l.name }}</td><td>{{ l.method }}</td><td>{{ l.created_at[:16]|replace('T', ' ') }}</td></tr>
+                <tr><td>{{ l.name }}</td><td>{{ l.method }}</td><td>{% if l.status == 'granted' %}<span class="badge badge-ok">Autorisé</span>{% else %}<span class="badge badge-warn">Refusé</span>{% endif %}</td><td>{{ l.created_at[:16]|replace('T', ' ') }}</td></tr>
               {% endfor %}
             </tbody>
           </table>
