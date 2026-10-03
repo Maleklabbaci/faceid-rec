@@ -21,11 +21,11 @@ async function waitFor(url, ms = 90000) {
 before(async () => {
   if (!BASE) {
     BASE = `http://127.0.0.1:${PORT}`;
-    server = spawn("npx", ["wrangler", "pages", "dev", "site", "--d1", "DB=faceid", "--port", String(PORT), "--ip", "127.0.0.1", "--persist-to", ".wrangler/test-state"], { stdio: "ignore" });
+    server = spawn("npx", ["wrangler", "pages", "dev", "site", "--d1", "DB=faceid", "--port", String(PORT), "--ip", "127.0.0.1", "--persist-to", ".wrangler/test-state"], { stdio: "ignore", detached: true });
   }
   await waitFor(BASE + "/api/healthz");
 });
-after(() => { if (server) server.kill("SIGTERM"); });
+after(() => { if (server) { try { process.kill(-server.pid, "SIGTERM"); } catch (_) { server.kill("SIGTERM"); } } });
 
 // Minimal cookie-aware client, same-origin headers like a browser fetch.
 function client() {

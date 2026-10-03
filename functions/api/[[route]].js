@@ -98,8 +98,9 @@ function cookieValue(request, name) {
   return null;
 }
 
-function sessionCookie(token, maxAge) {
-  return `sid=${token}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${maxAge}`;
+function sessionCookie(token, maxAge, env) {
+  // EMBED_PREVIEW=1 (local demos inside a third-party iframe only) relaxes SameSite; never set it in production.
+  return `sid=${token}; Path=/; HttpOnly; Secure; SameSite=${env && env.EMBED_PREVIEW ? "None" : "Lax"}; Max-Age=${maxAge}`;
 }
 
 function localParts(timezone, date = new Date()) {
@@ -179,7 +180,7 @@ async function startSession(env, userId) {
   const id = await sha256hex(token);
   const maxAge = SESSION_DAYS * 86400;
   await env.DB.prepare("INSERT INTO sessions(id,user_id,expires_at) VALUES(?,?,?)").bind(id, userId, Date.now() + maxAge * 1000).run();
-  return sessionCookie(token, maxAge);
+  return sessionCookie(token, maxAge, env);
 }
 
 async function memberOf(env, user, memberId) {
@@ -263,7 +264,7 @@ async function logout(env, request) {
   assertSameOrigin(request);
   const token = cookieValue(request, "sid");
   if (token) await env.DB.prepare("DELETE FROM sessions WHERE id=?").bind(await sha256hex(token)).run();
-  return json({ ok: true, redirect: "/" }, 200, { "Set-Cookie": sessionCookie("", 0) });
+  return json({ ok: true, redirect: "/" }, 200, { "Set-Cookie": sessionCookie("", 0, env) });
 }
 
 async function state(env, user) {
