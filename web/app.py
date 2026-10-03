@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from flask import Flask, abort, flash, g, jsonify, make_response, redirect, render_template, request, session, url_for
 from PIL import Image, UnidentifiedImageError
+from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
 
 # One platform, four target segments. Each sector drives vocabulary, KPIs and access rules.
@@ -58,9 +59,13 @@ def tz_of(name):
 
 def create_app(config=None):
     app = Flask(__name__, instance_relative_config=True)
-    Path(app.instance_path).mkdir(parents=True, exist_ok=True)
-    # Persist a random local key; production must inject its own secret.
-    key_path = Path(app.instance_path) / "session.key"
+    # All persistent files (database, generated session key) live next to WEB_DATABASE
+    # when it is set (e.g. a Docker volume), otherwise in Flask's instance folder.
+    database = os.environ.get("WEB_DATABASE") or str(Path(app.instance_path) / "web.db")
+    data_dir = Path(database).parent
+    data_dir.mkdir(parents=True, exist_ok=True)
+    # Persist a random local key; production should inject its own SECRET_KEY.
+    key_path = data_dir / "session.key"
     if not os.environ.get("SECRET_KEY") and not key_path.exists():
         try:
             fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -73,17 +78,36 @@ def create_app(config=None):
     embed = os.environ.get("EMBED_PREVIEW") == "1"
     app.config.update(
         SECRET_KEY=os.environ.get("SECRET_KEY") or key_path.read_text(),
-        DATABASE=os.environ.get("WEB_DATABASE") or str(Path(app.instance_path) / "web.db"),
+        DATABASE=database,
         MAX_CONTENT_LENGTH=3 * 1024 * 1024,
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="None" if embed else "Lax",
         SESSION_COOKIE_SECURE=True if embed else os.environ.get("COOKIE_SECURE", "1") == "1",
         PERMANENT_SESSION_LIFETIME=timedelta(hours=8),
         ALLOW_EMBED=embed,
+        # TRUST_PROXY=1 when running behind Cloudflare Tunnel / Nginx: real client IP and scheme
+        TRUST_PROXY=os.environ.get("TRUST_PROXY") == "1",
     )
     if config:
         app.config.update(config)
+    if app.config["TRUST_PROXY"]:
+        app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
     limits = defaultdict(deque)
+    face_engine = {"available": None}
+
+    def face_engine_available():
+        if face_engine["available"] is None:
+            try:
+                import face_recognition  # noqa: F401  (loads dlib models once per process)
+                face_engine["available"] = True
+            except ImportError:
+                face_engine["available"] = False
+        return face_engine["available"]
+
+    if os.environ.get("PRELOAD_FACE") == "1":
+        # Warm the face engine at startup; with "gunicorn --preload" the ~100 MB of models
+        # are loaded once and shared by all workers.
+        face_engine_available()
 
     def db():
         if "db" not in g:
@@ -148,7 +172,8 @@ def create_app(config=None):
 
     def limited(bucket, count, seconds=60):
         # Single-process MVP protection. Use shared Redis limits for production.
-        key = (bucket, g.user["id"] if g.user else request.remote_addr)
+        client_ip = (request.headers.get("CF-Connecting-IP") if app.config["TRUST_PROXY"] else None) or request.remote_addr
+        key = (bucket, g.user["id"] if g.user else client_ip)
         now = time.monotonic()
         q = limits[key]
         while q and q[0] < now - seconds:
@@ -219,6 +244,11 @@ def create_app(config=None):
         db().execute("INSERT INTO entries(org_id,member_id,actor_id,created_at,method,status,local_date,local_time,late) VALUES(?,?,?,?,?,?,?,?,?)", (g.user["org_id"], row["id"], g.user["id"], datetime.now(timezone.utc).isoformat(), method, status, day, hhmm, int(result["late"])))
         db().commit()
         return result
+
+    @app.get("/healthz")
+    def healthz():
+        db().execute("SELECT 1").fetchone()
+        return jsonify(status="ok", face_engine=face_engine_available())
 
     @app.get("/")
     def index():

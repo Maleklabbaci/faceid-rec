@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mon espace — FaceID Platform</title>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body class="app sector-fitness" data-voice-base="/voice/">
+<div class="shell">
+  <aside class="sidebar">
+    <a class="brand brand-light" href="/"><span class="logo">F</span> FaceID</a>
+    <div class="org">
+      <strong id="org-name">…</strong>
+      <span class="badge badge-sector" id="org-sector"></span>
+    </div>
+    <nav class="menu" id="menu">
+      <a href="#overview" data-page="overview">Tableau de bord</a>
+      <a href="#members" data-page="members">Membres</a>
+      <a href="#access" data-page="access">Contrôle d'accès</a>
+      <a href="#settings" data-page="settings">Paramètres</a>
+    </nav>
+    <div class="logout">
+      <span class="muted small" id="user-email"></span>
+      <button class="btn btn-ghost btn-sm" type="button" id="logout">Déconnexion</button>
+    </div>
+  </aside>
+
+  <main class="content">
+    <p class="flash" id="flash" hidden></p>
+    <div id="page"><p class="muted">Chargement de votre espace…</p></div>
+  </main>
+</div>
+
+<dialog id="enroll-dialog" class="dialog">
+  <h2>Capturer le visage de <span id="enroll-name"></span></h2>
+  <p class="muted small">La personne regarde la caméra ; la capture se fait automatiquement dès que son accord est coché. L'analyse a lieu dans ce navigateur : aucune image n'est envoyée, seule une empreinte numérique (128 nombres) est enregistrée dans l'espace de votre entreprise, effaçable à tout moment.</p>
+  <div class="video-wrap">
+    <video id="enroll-video" autoplay playsinline muted></video>
+    <div id="enroll-countdown" class="countdown" hidden></div>
+  </div>
+  <label class="consent"><input type="checkbox" id="enroll-consent"> La personne est présente et a donné son accord pour l'enregistrement de son visage.</label>
+  <p id="enroll-status" class="status" aria-live="polite"></p>
+  <small class="muted js-voice-info"></small>
+  <div class="dialog-actions">
+    <button class="btn btn-ghost" type="button" id="enroll-cancel">Annuler</button>
+    <button class="btn btn-primary" type="button" id="enroll-capture">Capturer maintenant</button>
+  </div>
+</dialog>
+
+<script src="/vendor/face-api.js" defer></script>
+<script src="/assets/face.js" defer></script>
+<script src="/assets/app.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Créer mon espace — FaceID Platform</title>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body class="auth">
+<main class="auth-wrap">
+  <a class="brand" href="/"><span class="logo">F</span> FaceID Platform</a>
+  <section class="card auth-card">
+    <h1>Créer l'espace de votre entreprise</h1>
+    <p class="flash" id="flash" hidden></p>
+    <form id="auth-form" data-endpoint="/api/signup">
+      <label>Nom de l'entreprise
+        <input name="company" required maxlength="100" placeholder="Ex. : Salle Olympia">
+      </label>
+      <label>Secteur d'activité
+        <select name="sector" required id="sector-select">
+          <option value="fitness">Salles de sport & fitness</option>
+          <option value="office">PME & bureaux</option>
+          <option value="coworking">Coworking & centres de formation</option>
+          <option value="canteen">Cantines & écoles privées</option>
+        </select>
+      </label>
+      <label>Email professionnel
+        <input type="email" name="email" required maxlength="254" autocomplete="username">
+      </label>
+      <label>Mot de passe <span class="muted small">(12 caractères minimum)</span>
+        <input type="password" name="password" required minlength="12" maxlength="256" autocomplete="new-password">
+      </label>
+      <button class="btn btn-primary btn-block" type="submit">Créer mon espace</button>
+    </form>
+    <p class="muted small">Déjà un compte ? <a href="/login">Se connecter</a></p>
+  </section>
+</main>
+<script src="/assets/auth.js" defer></script>
+</body>
+</html>
