@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}FaceID Platform{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+</head>
+<body class="{% block body_class %}{% endblock %}" data-voice-base="{{ url_for('static', filename='voice/') }}">
+  {% block body %}{% endblock %}
+  <script src="{{ url_for('static', filename='app.js') }}" defer></script>
+</body>
+</html>

@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}Erreur {{ error.code }} — FaceID Platform{% endblock %}
+{% block body_class %}auth{% endblock %}
+{% block body %}
+<main class="auth-wrap">
+  <a class="brand" href="{{ url_for('index') }}"><span class="logo">F</span> FaceID Platform</a>
+  <section class="card auth-card">
+    <h1>Erreur {{ error.code }}</h1>
+    <p>{{ error.description }}</p>
+    <a class="btn btn-primary" href="{{ url_for('dashboard') if user else url_for('index') }}">Retour</a>
+  </section>
+</main>
+{% endblock %}
