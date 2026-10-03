@@ -4,12 +4,37 @@ Deux produits dans ce dépôt :
 
 | | Dossier | Pour qui |
 |---|---|---|
-| **Plateforme web (SaaS)** | `web/` | Vendre à plusieurs entreprises : chaque client crée son espace, gère ses membres/abonnements et contrôle les entrées depuis un navigateur. |
+| **Plateforme web — édition Cloudflare (recommandée)** | `site/` + `functions/` | 100 % hébergée chez Cloudflare (Pages + Functions + D1), gratuite, « push → en ligne ». La reconnaissance faciale tourne dans le navigateur du kiosque. Guide : **[deploy/cloudflare-pages.md](deploy/cloudflare-pages.md)**. |
+| **Plateforme web — édition auto-hébergée** | `web/` | Même produit en Flask + dlib pour un VPS / PC sur site, exposé via Cloudflare Tunnel. Guide : [deploy/cloudflare.md](deploy/cloudflare.md). |
 | **Application bureau (historique)** | `app.py`, `main.py`, `register.py` | Un PC sur site avec webcam + éventuel relais Arduino pour ouvrir une porte. |
+
+Les deux éditions web partagent le même produit (espace privé par entreprise, 4 secteurs, membres et abonnements, kiosque facial avec voix, journal et tableau de bord) et le même modèle de reconnaissance (ResNet 128-d de dlib ; `face-api.js` en est le portage navigateur).
 
 ---
 
-## 1. Plateforme web
+## 0. Édition Cloudflare (Pages + Functions + D1) — mise en ligne en 6 réglages
+
+```
+site/                      interface statique (accueil, connexion, application, kiosque)
+site/vendor/face-api.js    moteur facial navigateur (détection + empreinte 128-d)
+site/models/               poids des 3 réseaux (≈ 6,5 Mo, mis en cache un an)
+functions/api/[[route]].js API JSON : comptes, membres, enrôlement, reconnaissance, règles secteur, journal
+schema.sql                 schéma D1 (créé automatiquement au premier appel)
+tests/cloudflare.test.mjs  8 tests de bout en bout (npm test)
+```
+
+Réglages du projet Pages : *Build output directory* = `site`, base D1 `faceid` liée sous le nom **`DB`**, secret **`PEPPER`**, branche de production `main`. Détail pas à pas, dépannage de l'erreur SSL des URL de prévisualisation, domaine personnalisé : **[deploy/cloudflare-pages.md](deploy/cloudflare-pages.md)**.
+
+```bash
+npm install && npm run dev     # http://localhost:8788 avec une base D1 locale
+npm test                       # tests API (démarre un serveur wrangler local)
+```
+
+Comment la reconnaissance fonctionne sans serveur : le kiosque calcule l'empreinte du visage dans le navigateur, la compare aux empreintes des membres de l'entreprise (téléchargées via `GET /api/descriptors`, consentement requis) et n'envoie que la décision (`POST /api/recognized`) ; l'API applique les règles (expiration, un repas/jour, retards, doublons 60 s) et tient le journal. Aucune image ne transite sur Internet.
+
+---
+
+## 1. Plateforme web — édition auto-hébergée (Flask)
 
 ### Lancer en local
 ```bash
@@ -64,8 +89,8 @@ Mots de passe hachés (Werkzeug), jeton CSRF sur tous les POST, cookies `HttpOnl
 pip install pytest && python -m pytest -q tests
 ```
 
-### Mettre en ligne — avec Cloudflare (recommandé)
-Workers/Pages ne peuvent pas exécuter le moteur facial (natif), mais **Cloudflare Tunnel** (gratuit) donne une URL HTTPS sur ton domaine à une app qui tourne sur ton PC ou un VPS, sans ouvrir de port. Tout est prêt :
+### Mettre en ligne l'édition auto-hébergée — avec Cloudflare Tunnel
+Cette édition exécute le moteur facial natif (dlib) côté serveur ; **Cloudflare Tunnel** (gratuit) donne une URL HTTPS sur ton domaine à une app qui tourne sur ton PC ou un VPS, sans ouvrir de port. Tout est prêt :
 ```bash
 cp .env.example .env          # SECRET_KEY + token du tunnel Cloudflare
 docker compose up -d --build  # app (gunicorn + moteur facial) + cloudflared

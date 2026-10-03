@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Connexion — FaceID Platform</title>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body class="auth">
+<main class="auth-wrap">
+  <a class="brand" href="/"><span class="logo">F</span> FaceID Platform</a>
+  <section class="card auth-card">
+    <h1>Connexion à votre espace</h1>
+    <p class="flash" id="flash" hidden></p>
+    <form id="auth-form" data-endpoint="/api/login">
+      <label>Email professionnel
+        <input type="email" name="email" required maxlength="254" autocomplete="username">
+      </label>
+      <label>Mot de passe
+        <input type="password" name="password" required maxlength="256" autocomplete="current-password">
+      </label>
+      <button class="btn btn-primary btn-block" type="submit">Se connecter</button>
+    </form>
+    <p class="muted small">Pas encore d'espace ? <a href="/signup">Créer un compte</a></p>
+  </section>
+</main>
+<script src="/assets/auth.js" defer></script>
+</body>
+</html>

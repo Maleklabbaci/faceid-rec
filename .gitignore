@@ -12,3 +12,5 @@ build/
 dist/
 installer_output/
 image-search/
+node_modules
+.wrangler/

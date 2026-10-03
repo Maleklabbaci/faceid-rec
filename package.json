@@ -1,0 +1,13 @@
+{
+  "name": "faceid-platform-cloudflare",
+  "private": true,
+  "description": "FaceID Platform — Cloudflare Pages edition (static site + Functions + D1). Local dev & tests only; nothing to build.",
+  "scripts": {
+    "dev": "wrangler pages dev site --d1 DB=faceid --port 8788 --ip 0.0.0.0",
+    "test": "node --test tests/cloudflare.test.mjs",
+    "deploy": "wrangler pages deploy site --project-name saaspromax"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}
