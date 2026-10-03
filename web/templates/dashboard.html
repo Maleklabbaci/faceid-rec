@@ -126,6 +126,7 @@
         <div class="video-wrap"><video id="enroll-video" autoplay playsinline muted></video></div>
         <label class="consent"><input type="checkbox" id="enroll-consent"> La personne consent à l'enregistrement de son visage pour le contrôle d'accès.</label>
         <p id="enroll-status" class="status" aria-live="polite"></p>
+        <small class="muted js-voice-info"></small>
         <div class="dialog-actions">
           <button class="btn btn-ghost" type="button" id="enroll-cancel">Annuler</button>
           <button class="btn btn-primary" type="button" id="enroll-capture" data-url-template="{{ url_for('enroll', member_id=0) }}">Capturer et enregistrer</button>
@@ -150,7 +151,9 @@
             <button class="btn btn-ghost" type="button" id="rec-start">Activer la caméra</button>
             <button class="btn btn-primary" type="button" id="rec-check" data-url="{{ url_for('recognize') }}" disabled>Vérifier maintenant</button>
             <label class="switch"><input type="checkbox" id="rec-auto" disabled> Mode automatique (kiosque)</label>
+            <button class="btn btn-ghost btn-sm js-voice-toggle" type="button" aria-pressed="true" title="Annonces vocales">🔊 Voix</button>
           </div>
+          <small class="muted js-voice-info"></small>
           <ul id="rec-live" class="live-list" aria-label="Derniers résultats"></ul>
         </section>
         <section class="card">

@@ -43,6 +43,7 @@ Autorise l'affichage dans une iframe d'un autre site (cookies `SameSite=None; Se
 - **Membres & abonnements** : ajout, date de fin, statut Actif/Expiré, renouvellement, suppression (efface aussi l'historique et les données biométriques).
 - **Contrôle d'accès (kiosque)** : caméra du navigateur en mode automatique (vérification toutes les 1,5 s, bandeau vert/orange/rouge), ou entrée manuelle sans caméra. Abonnement expiré = refus journalisé ; un même membre n'est compté qu'une fois par minute ; le plus grand visage est retenu si plusieurs personnes passent devant la caméra.
 - **Journal & tableau de bord** : membres actifs, passages du jour, graphique 7 jours, derniers passages.
+- **Annonces vocales (voix féminine, gratuites)** : « Caméra activée, permission accordée », « Approchez-vous de la caméra », « Bienvenue Amine, accès autorisé », « Accès refusé, abonnement expiré »… Utilise la synthèse vocale du navigateur (voix « Google français », Hortense, Denise…) qui peut dire le prénom ; si le navigateur n'a pas de voix féminine française, des clips enregistrés (`web/static/voice/`) prennent le relais. Bouton 🔊 pour couper.
 - **Biométrie avec consentement** : l'empreinte faciale n'est enregistrée qu'après une case de consentement explicite, et peut être effacée à tout moment.
 
 ### Sécurité incluse

@@ -302,12 +302,12 @@ def create_app(config=None):
         except (ValueError, UnidentifiedImageError, OSError, Image.DecompressionBombError):
             api_fail(400, "error", "Image invalide.")
         if not boxes:
-            api_fail(422, "no_face", "Aucun visage détecté. Placez-vous face à la caméra.")
+            api_fail(422, "no_face", "Aucun visage détecté. Placez-vous face à la caméra.", reason="none")
         if single and len(boxes) > 1:
             api_fail(422, "multi_face", "Plusieurs visages détectés : une seule personne à la fois pour l’enregistrement.")
         top, right, bottom, left = max(boxes, key=lambda b: (b[2] - b[0]) * (b[1] - b[3]))
         if bottom - top < MIN_FACE_HEIGHT:
-            api_fail(422, "no_face", "Visage trop éloigné : approchez-vous de la caméra.")
+            api_fail(422, "no_face", "Visage trop éloigné : approchez-vous de la caméra.", reason="far")
         encoding = face_recognition.face_encodings(frame, known_face_locations=[(top, right, bottom, left)])[0]
         return encoding, face_recognition, np
 

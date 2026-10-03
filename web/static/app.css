@@ -174,3 +174,5 @@ video { width: 100%; max-width: 480px; aspect-ratio: 4 / 3; background: #0b0d14;
 .live-list .live-expired { border-left-color: var(--warn); }
 .live-list .live-unknown { border-left-color: var(--danger); }
 .status a { color: var(--accent); font-weight: 600; text-decoration: underline; }
+.js-voice-info { display: block; margin-top: .5rem; }
+.js-voice-toggle[aria-pressed="false"] { color: var(--muted); }

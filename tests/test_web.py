@@ -202,3 +202,23 @@ def test_real_face_enroll_and_recognize(client):
     assert r.status_code == 403 and r.get_json()["status"] == "expired"
     page = client.get("/app/access").get_data(as_text=True)
     assert "Refusé</span>" in page and "Autorisé</span>" in page
+
+
+def test_blank_image_reports_no_face_with_reason(client):
+    import base64, io
+    from PIL import Image
+    pytest.importorskip("face_recognition")
+    signup(client, "a@b.c")
+    token = csrf_of(client, "/app")
+    buf = io.BytesIO()
+    Image.new("RGB", (640, 480), (200, 200, 200)).save(buf, "JPEG")
+    data = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+    r = client.post("/api/recognize", json={"image": data}, headers={"X-CSRF-Token": token})
+    assert r.status_code == 422 and r.get_json() == {"status": "no_face", "reason": "none", "message": "Aucun visage détecté. Placez-vous face à la caméra."}
+
+
+def test_voice_clips_served(client):
+    for name in ("granted", "expired", "unknown", "far", "none", "multi", "camera_on", "camera_denied", "auto_on", "enrolled"):
+        r = client.get(f"/static/voice/{name}.mp3")
+        assert r.status_code == 200 and r.mimetype == "audio/mpeg", name
+    assert 'data-voice-base="/static/voice/"' in client.get("/").get_data(as_text=True)
